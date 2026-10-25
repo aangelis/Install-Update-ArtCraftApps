@@ -1,2 +1,201 @@
-# Install-Update-ArtCraftApps
-One-script installer and updater for the whole ArtCraft suite on Windows.
+# ArtCraft Suite Manager
+
+A single-file PowerShell script that audits, installs and updates the whole **ArtCraft** app suite (plus the ArtCraft Launcher) on Windows — one run, no interaction, no GUI.
+
+It was born as a lightweight alternative updater for older and slower machines, where the official launcher felt heavy for what is essentially "check a version number, download an MSI, run it quietly". Since then it has grown into a full state-reconciliation tool: it detects what is actually installed (even when the registry and winget disagree), resolves the newest release straight from the GitHub API, and only touches the apps that genuinely need it.
+
+## Origin & credits
+
+The initial idea comes from this community post:
+
+**[Lightweight ArtCraft app updater for older/slow [PCs] — r/ArtCraftAI](https://www.reddit.com/r/ArtCraftAI/comments/1xc0uty/lightweight_artcraft_app_updater_for_olderslow/)**
+
+That concept has since evolved well beyond a simple "download and run the installer" loop. Notable additions over the original approach:
+
+- Normalized name matching, so `ArtCraft Launcher`, `artcraft-launcher` and `ArtCraft_Launcher` are all recognized as the same product
+- ProductCode (uninstall GUID) detection as a fallback when winget and the registry report different identifiers
+- Dynamic latest-version lookup via the GitHub Releases API instead of hardcoded URLs
+- MSI signature validation before execution
+- Proper msiexec exit-code handling, including a retry on `1618`
+- Pre-install process termination to avoid file locks
+- A same-version guard that skips pointless reinstalls
+
+## What it does
+
+For each of the 14 suite applications the script answers three questions:
+
+1. **Is it installed?** — checked via filesystem probes, `winget list`, and the Windows uninstall registry
+2. **What version is it?** — read from the executable's `ProductVersion`, falling back to the registry `DisplayVersion`
+3. **Is there something newer?** — queried live from the corresponding GitHub repository's latest release
+
+Based on the answers it then does exactly one of four things: **skip**, **upgrade via winget**, **upgrade via MSI**, or **fresh install**. At the end it prints a summary and sets the process exit code.
+
+## Managed applications
+
+| App | winget ID | GitHub repo | Executable |
+|---|---|---|---|
+| ArtCraftLauncher | `ArtCraft.ArtCraftLauncher` | `craft-launcher` | `ArtCraftLauncher.exe` |
+| PhotoCraft | `ArtCraft.PhotoCraft` | `photocraft` | `PhotoCraft.exe` |
+| VectorCraft | `ArtCraft.VectorCraft` | `vectorcraft` | `VectorCraft.exe` |
+| PdfCraft | `ArtCraft.PdfCraft` | `pdfcraft` | `PdfCraft.exe` |
+| WordCraft | `ArtCraft.WordCraft` | `wordcraft` | `WordCraft.exe` |
+| GridCraft | `ArtCraft.GridCraft` | `gridcraft` | `GridCraft.exe` |
+| LightCraft | `ArtCraft.LightCraft` | `lightcraft` | `LightCraft.exe` |
+| FilmCraft | `ArtCraft.FilmCraft` | `filmcraft` | `FilmCraft.exe` |
+| DesignCraft | `ArtCraft.DesignCraft` | `designcraft` | `DesignCraft.exe` |
+| EffectCraft | `ArtCraft.EffectCraft` | `effectcraft` | `EffectCraft.exe` |
+| DeckCraft | `ArtCraft.DeckCraft` | `deckcraft` | `DeckCraft.exe` |
+| CADCraft | `ArtCraft.CadCraft` | `cadcraft` | `CADCraft.exe` |
+| SoundCraft | `ArtCraft.SoundCraft` | `soundcraft` | `SoundCraft.exe` |
+| FigCraft | `ArtCraft.FigCraft` | `figcraft` | `FigCraft.exe` |
+
+Adding another app is a one-line change — see [Configuration](#configuration).
+
+## How it works
+
+### 1. Installation detection
+
+An app counts as installed if **any** of these is true:
+
+- One of the probed paths exists (`%ProgramFiles%`, `%ProgramFiles(x86)%`, `%LOCALAPPDATA%\Programs`, plus a few explicit spelling variants of the launcher folder)
+- The winget ID appears in `winget list`
+- The uninstall **ProductCode** (GUID) appears in `winget list`
+- A matching entry is found in the uninstall registry
+
+Registry scanning covers all three relevant hives: `HKLM\...\Uninstall`, `HKLM\WOW6432Node\...\Uninstall` and `HKCU\...\Uninstall`. Matching is done on a **normalized** display name — spaces, hyphens and underscores are stripped and the comparison is case-insensitive and substring-based — which is what makes the script survive inconsistent naming between installer builds.
+
+### 2. Version resolution
+
+The newest release is fetched from:
+
+```
+GET https://api.github.com/repos/<owner>/<repo>/releases/latest
+```
+
+with a proper `User-Agent` and `Accept: application/vnd.github+json` header and a 45-second timeout. From the response the script picks the first `*.msi` asset, preferring x64/AMD64 builds over anything else, and strips the leading `v` from the tag name.
+
+Comparison uses .NET `[version]` objects rather than string comparison, after trimming pre-release/build suffixes, so `0.9.0` vs `0.10.0` is ordered correctly.
+
+### 3. Decision logic
+
+| State | Remote version | Action |
+|---|---|---|
+| Installed | equal to local | Skip ("already at latest version") |
+| Installed | newer | `winget upgrade` → on failure `winget upgrade --force` → on failure silent MSI |
+| Installed | older or unparsable | Skip |
+| Missing | any | `winget install`, verified with `winget list` → on failure silent MSI |
+| Any | GitHub lookup failed | Reported, app treated as OK (installed) or skipped (missing) |
+
+### 4. Silent MSI installation
+
+When winget can't do the job, the script falls back to the release asset:
+
+1. Downloads to `%TEMP%\<AppName>-bootstrap.msi`
+2. **Validates the file** by reading its first four bytes and checking for the OLE compound-document magic number `D0 CF 11 E0` — this catches the classic failure mode where an error page or redirect gets saved as `.msi`
+3. Terminates any running instance of the app to avoid file locks
+4. Runs `msiexec /i "<msi>" /qn /norestart /L*v "<log>"`
+5. Interprets the exit code properly (see below)
+6. Deletes the downloaded MSI
+
+Leftover Craft MSI files elsewhere on the system are deliberately **not** cleaned up — they may still be needed for repairs.
+
+### 5. Exit-code handling
+
+| Code | Meaning | Behaviour |
+|---|---|---|
+| `0` | Success | Continue |
+| `3010` | Success, reboot required | Counted as success, warning printed |
+| `1641` | Success, reboot initiated | Counted as success, warning printed |
+| `1618` | Another installation in progress | Waits 15 s and retries once |
+| anything else | Failure | Prints the exit code, the log path, and a manual `msiexec` command to try |
+
+### 6. API resilience
+
+Every GitHub call is wrapped in a try/catch with an explicit timeout. If a request fails — rate limiting, network hiccup, outage, a repo without an MSI asset — the script logs the reason and moves on instead of aborting. Installed apps are then simply considered current, and missing ones are marked as failed.
+
+This matters because the script makes one API call per app (~14 per run): treating a rejected request as a fatal error would turn a single throttled call into a cascade of bogus failures, and retrying aggressively would only make the throttling worse. Failing soft and continuing is the deliberate strategy here.
+
+## Requirements
+
+- Windows 10 or Windows 11
+- Windows PowerShell 5.1+ (works in PowerShell 7 too)
+- [winget](https://aka.ms/getwinget) / App Installer — strongly recommended; without it the script falls back to MSI-only operation
+- Internet access to `api.github.com` and GitHub release assets
+- An **elevated** shell is recommended: machine-wide MSI installs and `HKLM` registry reads generally require administrator rights
+
+## Usage
+
+```powershell
+# Recommended: run from an elevated PowerShell window
+powershell -ExecutionPolicy Bypass -File .\Install-Update-ArtCraftApps.ps1
+```
+
+Or, from inside a PowerShell session:
+
+```powershell
+Set-ExecutionPolicy -Scope Process Bypass
+.\Install-Update-ArtCraftApps.ps1
+```
+
+The script is fully unattended: it prints a progress line per app (`[3/14] Processing VectorCraft...`) and finishes with a summary such as:
+
+```
+========================================
+Summary:
+  Successful: 14 / 14
+  Failed:     0 / 14
+Architecture sync complete.
+```
+
+### Exit codes
+
+- `0` — every app ended up installed and current
+- `1` — at least one app failed (the names are listed in the summary)
+
+This makes it easy to chain from Task Scheduler or CI.
+
+## Logs & troubleshooting
+
+- Per-app MSI log: `%TEMP%\<AppName>-msi.log`
+- Downloaded installer: `%TEMP%\<AppName>-bootstrap.msi` (removed after a successful run)
+
+Common causes of failure and what the script tells you:
+
+- **"The file is not a valid MSI (probably an HTML page)"** — the download URL returned markup rather than a binary; usually a changed asset name or a captive portal/proxy interfering
+- **"No MSI asset found in release …"** — the release exists but ships no `.msi`
+- **"Another installation is in progress (1618)"** — Windows Installer service busy; the script retries once, and suggests waiting or rerunning
+- **Non-zero msiexec code** — the printed log path holds the verbose MSI log, and the script echoes a manual `msiexec /i …` command you can run interactively
+
+## Configuration
+
+Everything lives in two places at the top of the file.
+
+Change the GitHub account that hosts the releases:
+
+```powershell
+$gitHubUser = "storytold"
+```
+
+Add or remove apps by editing the definition array. The format is
+`Name|WingetId|GitHubRepo|ExeName`:
+
+```powershell
+$appDefs = @(
+    "ArtCraftLauncher|ArtCraft.ArtCraftLauncher|craft-launcher|ArtCraftLauncher.exe",
+    # ...
+    "MyNewCraft|ArtCraft.MyNewCraft|mynewcraft|MyNewCraft.exe"
+)
+```
+
+Malformed entries (wrong field count or empty fields) are skipped with a warning instead of crashing the run.
+
+## Known limitations & cautions
+
+- **Process termination is heuristic.** Before installing, the script derives a keyword from the app name (e.g. `PhotoCraft` → `photo`) and stops any process whose name *contains* it. Because it is a substring match, it can in principle hit unrelated processes with a coincidentally similar name. Tightening this to exact process-name matching is a sensible hardening step.
+- **Unauthenticated GitHub API calls.** The script sends no token, so it is subject to the standard anonymous rate limit. Running it many times per hour may trigger throttling; the soft-fail behaviour keeps that harmless, but it also means updates can be silently reported as "up to date" during a throttle window. Supplying a `GITHUB_TOKEN` and/or caching the release lookup would remove that blind spot.
+- **No rollback.** Once an MSI install starts, the script cannot revert it; use the MSI log if something goes wrong.
+- **Windows only.** The suite ships for macOS and Linux too, but this script targets Windows/MSI/winget exclusively.
+
+## Disclaimer
+
+This is an independent, community-made utility. It is not affiliated with or endorsed by the ArtCraft project. It downloads and executes installers published in the configured GitHub repositories — review the source before running it, and prefer running it against repositories you trust.
