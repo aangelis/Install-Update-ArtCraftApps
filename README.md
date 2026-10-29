@@ -33,22 +33,22 @@ Based on the answers it then does exactly one of four things: **skip**, **upgrad
 
 ## Managed applications
 
-| App | winget ID | GitHub repo | Executable |
+| App | winget ID | GitHubUser | GitHub repo | Executable |
 |---|---|---|---|
-| ArtCraftLauncher | `ArtCraft.ArtCraftLauncher` | `craft-launcher` | `ArtCraftLauncher.exe` |
-| PhotoCraft | `ArtCraft.PhotoCraft` | `photocraft` | `PhotoCraft.exe` |
-| VectorCraft | `ArtCraft.VectorCraft` | `vectorcraft` | `VectorCraft.exe` |
-| PdfCraft | `ArtCraft.PdfCraft` | `pdfcraft` | `PdfCraft.exe` |
-| WordCraft | `ArtCraft.WordCraft` | `wordcraft` | `WordCraft.exe` |
-| GridCraft | `ArtCraft.GridCraft` | `gridcraft` | `GridCraft.exe` |
-| LightCraft | `ArtCraft.LightCraft` | `lightcraft` | `LightCraft.exe` |
-| FilmCraft | `ArtCraft.FilmCraft` | `filmcraft` | `FilmCraft.exe` |
-| DesignCraft | `ArtCraft.DesignCraft` | `designcraft` | `DesignCraft.exe` |
-| EffectCraft | `ArtCraft.EffectCraft` | `effectcraft` | `EffectCraft.exe` |
-| DeckCraft | `ArtCraft.DeckCraft` | `deckcraft` | `DeckCraft.exe` |
-| CADCraft | `ArtCraft.CadCraft` | `cadcraft` | `CADCraft.exe` |
-| SoundCraft | `ArtCraft.SoundCraft` | `soundcraft` | `SoundCraft.exe` |
-| FigCraft | `ArtCraft.FigCraft` | `figcraft` | `FigCraft.exe` |
+| ArtCraftLauncher | `ArtCraft.ArtCraftLauncher` | `storytold` | `craft-launcher` | `ArtCraftLauncher.exe` |
+| PhotoCraft | `ArtCraft.PhotoCraft` | `storytold` | `photocraft` | `PhotoCraft.exe` |
+| VectorCraft | `ArtCraft.VectorCraft` | `storytold` | `vectorcraft` | `VectorCraft.exe` |
+| PdfCraft | `ArtCraft.PdfCraft` | `storytold` | `pdfcraft` | `PdfCraft.exe` |
+| WordCraft | `ArtCraft.WordCraft` | `storytold` | `wordcraft` | `WordCraft.exe` |
+| GridCraft | `ArtCraft.GridCraft` | `storytold` | `gridcraft` | `GridCraft.exe` |
+| LightCraft | `ArtCraft.LightCraft` | `storytold` | `lightcraft` | `LightCraft.exe` |
+| FilmCraft | `ArtCraft.FilmCraft` | `storytold` | `filmcraft` | `FilmCraft.exe` |
+| DesignCraft | `ArtCraft.DesignCraft` | `storytold` | `designcraft` | `DesignCraft.exe` |
+| EffectCraft | `ArtCraft.EffectCraft` | `storytold` | `effectcraft` | `EffectCraft.exe` |
+| DeckCraft | `ArtCraft.DeckCraft` | `storytold` | `deckcraft` | `DeckCraft.exe` |
+| CADCraft | `ArtCraft.CadCraft` | `storytold` | `cadcraft` | `CADCraft.exe` |
+| SoundCraft | `ArtCraft.SoundCraft` | `storytold` | `soundcraft` | `SoundCraft.exe` |
+| FigCraft | `ArtCraft.FigCraft` | `tangency-labs` | `figcraft` | `FigCraft.exe` |
 
 Adding another app is a one-line change — see [Configuration](#configuration).
 
