@@ -19,6 +19,7 @@ That concept has since evolved well beyond a simple "download and run the instal
 - Proper msiexec exit-code handling, including a retry on `1618`
 - Pre-install process termination to avoid file locks
 - A same-version guard that skips pointless reinstalls
+- Local version cache to minimize GitHub API calls across lab machines
 
 ## What it does
 
@@ -74,7 +75,24 @@ GET https://api.github.com/repos/<owner>/<repo>/releases/latest
 
 with a proper `User-Agent` and `Accept: application/vnd.github+json` header and a 45-second timeout. From the response the script picks the first `*.msi` asset, preferring x64/AMD64 builds over anything else, and strips the leading `v` from the tag name.
 
-Comparison uses .NET `[version]` objects rather than string comparison, after trimming pre-release/build suffixes, so `0.9.0` vs `0.10.0` is ordered correctly.
+**Cache behavior:**
+
+- **First run:** All 14 releases are fetched from GitHub API; results are saved to a JSON file
+- **Subsequent runs (within 24h):** Cached versions are reused — **zero API calls**
+- **Expired entry (>24h):** Individual entries expire separately based on their own timestamp, not a global file timestamp
+- **API failure:** If GitHub is unreachable, stale cache entries are still used to avoid blocking the entire run
+
+Cache file locations:
+
+| `$VersionCachePathOverride` | Location |
+|------------------------------|----------|
+| Empty (default) | Same folder as the script |
+| Folder path | `<path>/artcraft-version-cache.json` |
+| File path (ends in `.json`) | Exact file path |
+
+This allows you to either keep a per-machine cache or share one cache file across an entire lab via a network share.
+
+**Comparison uses .NET `[version]` objects** rather than string comparison, after trimming pre-release/build suffixes, so `0.9.0` vs `0.10.0` is ordered correctly.
 
 ### 3. Decision logic
 
@@ -114,6 +132,8 @@ Leftover Craft MSI files elsewhere on the system are deliberately **not** cleane
 Every GitHub call is wrapped in a try/catch with an explicit timeout. If a request fails — rate limiting, network hiccup, outage, a repo without an MSI asset — the script logs the reason and moves on instead of aborting. Installed apps are then simply considered current, and missing ones are marked as failed.
 
 This matters because the script makes one API call per app (~14 per run): treating a rejected request as a fatal error would turn a single throttled call into a cascade of bogus failures, and retrying aggressively would only make the throttling worse. Failing soft and continuing is the deliberate strategy here.
+
+Combined with the local cache, this keeps unauthenticated API usage well within API limit per public IP, even when many machines all run the script within a day.
 
 ## Requirements
 
@@ -158,23 +178,31 @@ This makes it easy to chain from Task Scheduler or CI.
 
 - Per-app MSI log: `%TEMP%\<AppName>-msi.log`
 - Downloaded installer: `%TEMP%\<AppName>-bootstrap.msi` (removed after a successful run)
+- Winget operation log: %TEMP%\<AppName>-winget.log
+- Version cache: Same folder as script (or configured via $VersionCachePathOverride)
 
 Common causes of failure and what the script tells you:
 
 - **"The file is not a valid MSI (probably an HTML page)"** — the download URL returned markup rather than a binary; usually a changed asset name or a captive portal/proxy interfering
 - **"No MSI asset found in release …"** — the release exists but ships no `.msi`
 - **"Another installation is in progress (1618)"** — Windows Installer service busy; the script retries once, and suggests waiting or rerunning
+- **"Cache MISS for <repo>. Querying GitHub API..."** — cache expired or absent; this is normal on first run or after 24 hours
+- **"GitHub API rate limit reached (HTTP 403)"** — you've hit the anonymous rate limit; wait for reset or increase the cache TTL
 - **Non-zero msiexec code** — the printed log path holds the verbose MSI log, and the script echoes a manual `msiexec /i …` command you can run interactively
 
 ## Configuration
 
 Everything lives in two places at the top of the file.
 
+### GitHub account
+
 Change the GitHub account that hosts the releases:
 
 ```powershell
 $gitHubUser = "storytold"
 ```
+
+### Application definitions
 
 Add or remove apps by editing the definition array. The format is
 `Name|WingetId|GitHubRepo|ExeName`:
@@ -188,6 +216,32 @@ $appDefs = @(
 ```
 
 Malformed entries (wrong field count or empty fields) are skipped with a warning instead of crashing the run.
+
+### Version cache location
+
+By default, the version cache sits next to the script. To move it to a shared folder for lab-wide coordination:
+
+```powershell
+# Store in a custom folder (default filename appended)
+$VersionCachePathOverride = '\\fileserver\software\artcraft'
+
+# Or specify the exact file path
+$VersionCachePathOverride = '\\fileserver\software\artcraft\cache.json'
+
+# Keep the default (script folder)
+$VersionCachePathOverride = ''
+```
+
+If the folder doesn't exist, it will be created automatically. Multiple machines pointing to the same cache file means only one machine does the GitHub lookups; the rest reuse the cached versions until the 24-hour expiry.
+
+### Cache TTL
+
+How long a cached version lookup stays valid (in hours):
+```powershell
+$VersionCacheTTLHours = 24  # default
+```
+
+Increasing this value reduces API calls further at the cost of potentially staying on an older version for longer.
 
 ## Known limitations & cautions
 
