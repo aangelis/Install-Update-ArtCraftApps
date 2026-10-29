@@ -39,6 +39,24 @@
     - Cache writes go through a temporary file and a rename, so a reader never
       sees a half-written file (matters when the cache sits on a share).
     - API call / cache hit counters in the summary.
+
+    New in v7:
+    - New $UseWinget configuration switch (default $false). When the variable
+      is missing, empty or $false, winget is never used at all: no startup
+      "winget list" / "winget upgrade" probes, no "winget install", no
+      "winget upgrade". Every application is installed or updated from the MSI
+      attached to the latest GitHub release, always with ALLUSERS=1 (per-machine).
+      Setting it to $true restores the previous winget-first behaviour.
+    - MSI packages are downloaded into the folder that contains this script
+      instead of $env:TEMP, and they are kept there, so a later run of the
+      script reuses the package already on disk instead of downloading it
+      again. The file name contains the release version, so a package is only
+      reused for the version it actually belongs to.
+    - Downloads land in a ".part" file and are renamed only after the MSI
+      signature check passes, so a truncated download or an HTML error page
+      can never survive as a reusable package.
+    - If the script folder is not writable, the download folder falls back to
+      $env:TEMP automatically.
 #>
 
 $ProgressPreference = 'SilentlyContinue'
@@ -47,7 +65,25 @@ try { [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::
 $gitHubUser = "storytold"
 
 # ======================= LOCAL CONFIGURATION =======================
-# Version cache location override.
+# ---- Winget switch ----
+#
+#   $UseWinget = $false        (or the variable deleted / left empty)
+#       winget is never touched. No "winget list", no "winget upgrade",
+#       no "winget install". Every application is installed or updated from
+#       the MSI published on the latest GitHub release, always with
+#       ALLUSERS=1 (per-machine).
+#
+#   $UseWinget = $true
+#       winget is used exactly as before: a missing application is installed
+#       with "winget install" first, and an available update is applied with
+#       "winget upgrade" - except when the existing installation is
+#       machine-scoped, because winget cannot pass ALLUSERS=1.
+#
+#   String values ('true' / 'false') are accepted as well, so the setting can
+#   be driven from a wrapper script, a scheduled task or a build pipeline.
+$UseWinget = $false
+
+# ---- Version cache location override ----
 #
 #   Leave the value empty ('') to keep the cache file in the same folder as
 #   this script. Recommended for a standalone machine, or for a script that is
@@ -72,10 +108,9 @@ $VersionCacheTTLHours = 24
 
 $defaultCacheFileName = 'artcraft-version-cache.json'
 
-# ---------- Resolve the cache location ----------
+# ---------- Locate the folder this script lives in ----------
 
-# Locate the folder this script lives in. $PSScriptRoot covers -File and
-# dot-sourcing; the fallbacks cover unusual hosts.
+# $PSScriptRoot covers -File and dot-sourcing; the fallbacks cover unusual hosts.
 $scriptDir = $PSScriptRoot
 if ([string]::IsNullOrWhiteSpace($scriptDir)) {
     if ($MyInvocation.MyCommand.Path) {
@@ -88,6 +123,52 @@ if ([string]::IsNullOrWhiteSpace($scriptDir)) {
         $scriptDir = (Get-Location).Path
     }
 }
+
+# ---------- Resolve the winget switch ----------
+# Read defensively: the variable may have been removed from the script, and it
+# may hold a boolean or a string such as 'true' / 'false'.
+$wingetEnabled = $false
+$wingetVariable = Get-Variable -Name 'UseWinget' -Scope Script -ErrorAction SilentlyContinue
+if ($wingetVariable -and $null -ne $wingetVariable.Value) {
+    $wingetValue = $wingetVariable.Value
+    if ($wingetValue -is [bool]) {
+        $wingetEnabled = $wingetValue
+    }
+    elseif ($wingetValue -is [string]) {
+        $parsedBool = $false
+        if (-not [string]::IsNullOrWhiteSpace($wingetValue) -and
+            [bool]::TryParse($wingetValue.Trim(), [ref]$parsedBool)) {
+            $wingetEnabled = $parsedBool
+        }
+    }
+    else {
+        try { $wingetEnabled = [bool]$wingetValue } catch { $wingetEnabled = $false }
+    }
+}
+
+# ---------- Resolve the MSI download folder ----------
+# Downloaded packages live next to this script so that a later run finds them
+# already in place and skips the download. If that folder is not writable (for
+# example the script sits on a locked-down share), fall back to $env:TEMP.
+$downloadDir = $scriptDir
+$downloadDirWritable = $false
+if ($downloadDir -and (Test-Path -LiteralPath $downloadDir)) {
+    try {
+        $writeProbe = Join-Path $downloadDir '.artcraft-write-probe.tmp'
+        Set-Content -LiteralPath $writeProbe -Value 'probe' -Encoding ASCII -ErrorAction Stop
+        Remove-Item -LiteralPath $writeProbe -Force -ErrorAction SilentlyContinue
+        $downloadDirWritable = $true
+    }
+    catch {
+        $downloadDirWritable = $false
+    }
+}
+if (-not $downloadDirWritable) {
+    Write-Host "Warning: '$downloadDir' is not writable. MSI packages will be stored in $env:TEMP instead." -ForegroundColor DarkYellow
+    $downloadDir = $env:TEMP
+}
+
+# ---------- Resolve the cache location ----------
 
 # Read the override defensively: it may have been removed from the script.
 $cacheOverride = $null
@@ -124,6 +205,9 @@ if ($cacheDir -and -not (Test-Path -LiteralPath $cacheDir)) {
 # Counters, reported in the summary.
 $script:apiCallCount  = 0
 $script:cacheHitCount = 0
+
+# MSI packages touched during this run, reported in the summary.
+$script:usedPackages = @()
 
 # Winget error code emitted when the underlying MSI fails.
 $WINGET_ERROR_MSI_INSTALL_FAILED = -1978335159   # 0x8A150049
@@ -504,28 +588,54 @@ function Install-MsiFromUrl {
     param(
         [string]$Url,
         [string]$AppName,
-        [string]$ProcessName
+        [string]$ProcessName,
+        [string]$Version
     )
 
     if ([string]::IsNullOrWhiteSpace($ProcessName)) { $ProcessName = $AppName }
 
-    $msiPath = Join-Path $env:TEMP "$AppName-bootstrap.msi"
+    # Use versioned filename in download directory
+    $versionClean = ($Version -replace '[^0-9\.]', '')
+    $msiFileName = "$AppName-$versionClean.msi"
+    $msiPath = Join-Path $downloadDir $msiFileName
+    $partialPath = "$msiPath.part"
     $logFile = Join-Path $env:TEMP "$AppName-msi.log"
 
-    Write-Host "  -> Download: $Url" -ForegroundColor DarkGray
-    try {
-        Invoke-WebRequest -Uri $Url -OutFile $msiPath -UserAgent 'Mozilla/5.0' `
-                          -UseBasicParsing -TimeoutSec 600 -ErrorAction Stop
+    # Check if we already have the correct MSI from a previous run
+    if (Test-Path -LiteralPath $msiPath) {
+        Write-Host "  -> Reusing cached MSI: $msiFileName" -ForegroundColor Gray
+        $script:usedPackages += $msiFileName
     }
-    catch {
-        Write-Host "  -> Download failed: $($_.Exception.Message)" -ForegroundColor Red
-        return $false
-    }
+    else {
+        Write-Host "  -> Download: $Url" -ForegroundColor DarkGray
+        try {
+            Invoke-WebRequest -Uri $Url -OutFile $partialPath -UserAgent 'Mozilla/5.0' `
+                              -UseBasicParsing -TimeoutSec 600 -ErrorAction Stop
+        }
+        catch {
+            Write-Host "  -> Download failed: $($_.Exception.Message)" -ForegroundColor Red
+            Remove-Item $partialPath -Force -ErrorAction SilentlyContinue
+            return $false
+        }
 
-    if (-not (Test-IsMsiFile -Path $msiPath)) {
-        Write-Host "  -> The file is not a valid MSI (probably an HTML page). Deleting it." -ForegroundColor Red
-        Remove-Item $msiPath -Force -ErrorAction SilentlyContinue
-        return $false
+        if (-not (Test-IsMsiFile -Path $partialPath)) {
+            Write-Host "  -> The file is not a valid MSI (probably an HTML page). Deleting it." -ForegroundColor Red
+            Remove-Item $partialPath -Force -ErrorAction SilentlyContinue
+            return $false
+        }
+
+        # Rename from .part to final name only after validation passes
+        try {
+            Move-Item -LiteralPath $partialPath -Destination $msiPath -Force -ErrorAction Stop
+            Write-Host "  -> MSI saved as: $msiFileName" -ForegroundColor Gray
+        }
+        catch {
+            Write-Host "  -> Warning: Could not move MSI to final location: $($_.Exception.Message)" -ForegroundColor DarkYellow
+            Remove-Item $partialPath -Force -ErrorAction SilentlyContinue
+            return $false
+        }
+
+        $script:usedPackages += $msiFileName
     }
 
     # Match the exact process name supplied by the caller.
@@ -547,7 +657,6 @@ function Install-MsiFromUrl {
 
         if ($code -eq 0 -or $code -eq 3010 -or $code -eq 1641) {
             if ($code -ne 0) { Write-Host "  -> Installed (exit $code - a reboot may be required)." -ForegroundColor Yellow }
-            Remove-Item $msiPath -Force -ErrorAction SilentlyContinue
             return $true
         }
         if ($code -eq 1618 -and $attempt -lt 2) {
@@ -558,7 +667,6 @@ function Install-MsiFromUrl {
 
         Write-Host "  -> msiexec failed with exit code $code. Log: $logFile" -ForegroundColor Red
         Write-Host "  -> TIP: Check the log for scope mismatch or permission errors." -ForegroundColor DarkYellow
-        Remove-Item $msiPath -Force -ErrorAction SilentlyContinue
         return $false
     }
     return $false
@@ -659,9 +767,11 @@ foreach ($def in $appDefs) {
 
 if ($apps.Count -eq 0) { throw "No valid applications found in the definition list." }
 
-Write-Host "ArtCraft Suite Manager (Per-Machine Install v6 + Local Version Cache)..." -ForegroundColor Cyan
+Write-Host "ArtCraft Suite Manager (Per-Machine Install v7 + Local Version Cache)..." -ForegroundColor Cyan
 Write-Host "Enforcing per-machine installation scope for all applications..." -ForegroundColor Gray
+Write-Host "Winget usage: $(if ($wingetEnabled) { 'ENABLED' } else { 'DISABLED' })" -ForegroundColor Gray
 Write-Host "Logs will be written to: $env:TEMP" -ForegroundColor Gray
+Write-Host "MSI packages stored in: $downloadDir" -ForegroundColor Gray
 Write-Host "Version cache: $cacheFile" -ForegroundColor Gray
 Write-Host "  source: $cacheSource | TTL: ${cacheTTLHours}h" -ForegroundColor Gray
 
@@ -670,8 +780,16 @@ if (Test-PendingReboot) {
     Write-Host "      Consider rebooting before running this script." -ForegroundColor DarkYellow
 }
 
-$wingetUpgradeRaw = (winget upgrade --accept-source-agreements 2>&1 | Out-String)
-$installedAppsRaw = (winget list --accept-source-agreements 2>&1 | Out-String)
+$wingetUpgradeRaw = ''
+$installedAppsRaw = ''
+
+if ($wingetEnabled) {
+    $wingetUpgradeRaw = (winget upgrade --accept-source-agreements 2>&1 | Out-String)
+    $installedAppsRaw = (winget list --accept-source-agreements 2>&1 | Out-String)
+}
+else {
+    Write-Host "  -> Winget disabled: Skipping initial discovery phase." -ForegroundColor Gray
+}
 
 $totalApps    = $apps.Count
 $currentIndex = 1
@@ -695,7 +813,7 @@ foreach ($app in $apps) {
     $productCode = Get-ProductCode -AppName $app.Name
     $productCodeMatch = if ($productCode) { $installedAppsRaw -match [regex]::Escape($productCode) } else { $false }
 
-    if ($wingetIdMatch -or $productCodeMatch) {
+    if ($wingetEnabled -and ($wingetIdMatch -or $productCodeMatch)) {
         $inWingetList = $true
     }
 
@@ -741,46 +859,75 @@ foreach ($app in $apps) {
         if (Test-NewerVersion -Local $localVersion -Remote $release.Version) {
             Write-Host "  -> New release on GitHub: $($release.Version)" -ForegroundColor Magenta
 
-            # A machine-scoped installation cannot be upgraded by winget:
-            # winget invokes the MSI without ALLUSERS=1, the MSI falls back to
-            # per-user (MSIINSTALLPERUSER=1) and its LaunchCondition aborts with
-            # "This app is already installed for everyone" -> msiexec 1603 ->
-            # winget 0x8A150049. Skip winget in that case and use the MSI path
-            # below, which explicitly passes ALLUSERS=1.
-            $isMachineScoped  = ($existingInstall -and $existingInstall.Scope -eq 'machine')
-            $wingetHasUpgrade = $wingetUpgradeRaw -match [regex]::Escape($app.ID)
+            # If winget is disabled, skip all winget paths and go straight to MSI
+            if (-not $wingetEnabled) {
+                Write-Host "  -> Winget disabled: Using direct MSI install path." -ForegroundColor Gray
+            }
+            else {
+                # A machine-scoped installation cannot be upgraded by winget:
+                # winget invokes the MSI without ALLUSERS=1, the MSI falls back to
+                # per-user (MSIINSTALLPERUSER=1) and its LaunchCondition aborts with
+                # "This app is already installed for everyone" -> msiexec 1603 ->
+                # winget 0x8A150049. Skip winget in that case and use the MSI path
+                # below, which explicitly passes ALLUSERS=1.
+                $isMachineScoped  = ($existingInstall -and $existingInstall.Scope -eq 'machine')
+                $wingetHasUpgrade = $wingetUpgradeRaw -match [regex]::Escape($app.ID)
 
-            $handledByWinget = $false
+                $handledByWinget = $false
 
-            if ($wingetHasUpgrade -and -not $isMachineScoped) {
-                Write-Host "  -> Winget reports an available upgrade for this package." -ForegroundColor Gray
-                Stop-Process -Name $app.ProcessName -Force -ErrorAction SilentlyContinue
+                if ($wingetHasUpgrade -and -not $isMachineScoped) {
+                    Write-Host "  -> Winget reports an available upgrade for this package." -ForegroundColor Gray
+                    Stop-Process -Name $app.ProcessName -Force -ErrorAction SilentlyContinue
 
-                $wingetResult = Try-WingetUpgrade -WingetId $app.ID -AppName $app.Name
+                    $wingetResult = Try-WingetUpgrade -WingetId $app.ID -AppName $app.Name
 
-                if ($wingetResult.Success) {
-                    Write-Host "  -> Upgrade completed successfully via Winget!" -ForegroundColor Green
-                    $successCount++
-                    $handledByWinget = $true
+                    if ($wingetResult.Success) {
+                        Write-Host "  -> Upgrade completed successfully via Winget!" -ForegroundColor Green
+                        $successCount++
+                        $handledByWinget = $true
+                    }
+                    else {
+                        Write-Host "  -> Winget upgrade failed (exit code: $($wingetResult.ExitCode)). See: $($wingetResult.LogFile)" -ForegroundColor Yellow
+                        if ($wingetResult.ExitCode -eq $WINGET_ERROR_MSI_INSTALL_FAILED) {
+                            Write-Host "  -> 0x8A150049 = MSI install failed. If the MSI log reports" -ForegroundColor DarkYellow
+                            Write-Host "     'already installed for everyone', the existing install is machine-scoped" -ForegroundColor DarkYellow
+                            Write-Host "     and winget cannot pass ALLUSERS=1. Falling back to the MSI path." -ForegroundColor DarkYellow
+                        }
+                    }
+                }
+                elseif ($wingetHasUpgrade -and $isMachineScoped) {
+                    Write-Host "  -> Existing installation is machine-scoped (per-machine)." -ForegroundColor Gray
+                    Write-Host "  -> Skipping winget: it cannot pass ALLUSERS=1, so the MSI would reject it." -ForegroundColor Gray
                 }
                 else {
-                    Write-Host "  -> Winget upgrade failed (exit code: $($wingetResult.ExitCode)). See: $($wingetResult.LogFile)" -ForegroundColor Yellow
-                    if ($wingetResult.ExitCode -eq $WINGET_ERROR_MSI_INSTALL_FAILED) {
-                        Write-Host "  -> 0x8A150049 = MSI install failed. If the MSI log reports" -ForegroundColor DarkYellow
-                        Write-Host "     'already installed for everyone', the existing install is machine-scoped" -ForegroundColor DarkYellow
-                        Write-Host "     and winget cannot pass ALLUSERS=1. Falling back to the MSI path." -ForegroundColor DarkYellow
+                    Write-Host "  -> Winget does not have an upgrade available for this package." -ForegroundColor Gray
+                }
+
+                if (-not $handledByWinget) {
+                    Write-Host "  -> Trying GitHub MSI with forced per-machine scope..." -ForegroundColor Yellow
+
+                    Stop-Process -Name $app.ProcessName -Force -ErrorAction SilentlyContinue
+
+                    # Reverse-direction cleanup: a per-user copy is what blocks a
+                    # per-machine install, so only user-scoped entries are removed.
+                    if ($existingInstall -and $existingInstall.Scope -eq 'user') {
+                        Write-Host "  -> Detected per-user installation, removing before per-machine install..." -ForegroundColor Yellow
+                        Remove-ExistingInstallation -ProductName $app.Name -ProductCode $existingInstall.ProductCode -TargetScope 'machine'
+                    }
+
+                    if (Install-MsiFromUrl -Url $release.Url -AppName $app.Name -ProcessName $app.ProcessName -Version $release.Version) {
+                        Write-Host "  -> Upgrade completed successfully via MSI!" -ForegroundColor Green
+                        $successCount++
+                    }
+                    else {
+                        Write-Host "  -> Upgrade failed for $($app.Name)." -ForegroundColor Red
+                        $failCount++
+                        $failedApps += $app.Name
                     }
                 }
             }
-            elseif ($wingetHasUpgrade -and $isMachineScoped) {
-                Write-Host "  -> Existing installation is machine-scoped (per-machine)." -ForegroundColor Gray
-                Write-Host "  -> Skipping winget: it cannot pass ALLUSERS=1, so the MSI would reject it." -ForegroundColor Gray
-            }
-            else {
-                Write-Host "  -> Winget does not have an upgrade available for this package." -ForegroundColor Gray
-            }
 
-            if (-not $handledByWinget) {
+            if (-not $wingetEnabled -and -not $inWingetList) {
                 Write-Host "  -> Trying GitHub MSI with forced per-machine scope..." -ForegroundColor Yellow
 
                 Stop-Process -Name $app.ProcessName -Force -ErrorAction SilentlyContinue
@@ -792,7 +939,7 @@ foreach ($app in $apps) {
                     Remove-ExistingInstallation -ProductName $app.Name -ProductCode $existingInstall.ProductCode -TargetScope 'machine'
                 }
 
-                if (Install-MsiFromUrl -Url $release.Url -AppName $app.Name -ProcessName $app.ProcessName) {
+                if (Install-MsiFromUrl -Url $release.Url -AppName $app.Name -ProcessName $app.ProcessName -Version $release.Version) {
                     Write-Host "  -> Upgrade completed successfully via MSI!" -ForegroundColor Green
                     $successCount++
                 }
@@ -825,43 +972,55 @@ foreach ($app in $apps) {
 
         Write-Host "  -> Latest version: $($release.Version)" -ForegroundColor Gray
 
-        # Fresh install: no existing scope conflict, so winget is safe to try.
-        Write-Host "  -> Attempting installation via Winget..." -ForegroundColor Gray
-        $wingetResult = Try-WingetInstall -WingetId $app.ID -AppName $app.Name
+        if ($wingetEnabled) {
+            # Fresh install: no existing scope conflict, so winget is safe to try.
+            Write-Host "  -> Attempting installation via Winget..." -ForegroundColor Gray
+            $wingetResult = Try-WingetInstall -WingetId $app.ID -AppName $app.Name
 
-        if ($wingetResult.Success) {
-            Write-Host "  -> Clean installation completed successfully via Winget!" -ForegroundColor Green
-            $successCount++
-            $currentIndex++
-            continue
-        }
+            if ($wingetResult.Success) {
+                Write-Host "  -> Clean installation completed successfully via Winget!" -ForegroundColor Green
+                $successCount++
+                $currentIndex++
+                continue
+            }
 
-        Write-Host "  -> Winget installation failed (exit code: $($wingetResult.ExitCode)). See: $($wingetResult.LogFile)" -ForegroundColor Yellow
+            Write-Host "  -> Winget installation failed (exit code: $($wingetResult.ExitCode)). See: $($wingetResult.LogFile)" -ForegroundColor Yellow
 
-        # Check whether winget knows about this package at all
-        $check = (winget list --id $app.ID -e --accept-source-agreements 2>&1 | Out-String)
-        $wingetHasPackage = ($check -match [regex]::Escape($app.ID))
+            # Check whether winget knows about this package at all
+            $check = (winget list --id $app.ID -e --accept-source-agreements 2>&1 | Out-String)
+            $wingetHasPackage = ($check -match [regex]::Escape($app.ID))
 
-        if (-not $wingetHasPackage) {
-            Write-Host "  -> Package not found in winget. Falling back to GitHub Releases..." -ForegroundColor DarkYellow
+            if (-not $wingetHasPackage) {
+                Write-Host "  -> Package not found in winget. Falling back to GitHub Releases..." -ForegroundColor DarkYellow
+            }
+            else {
+                Write-Host "  -> Winget has the package but installation failed. Falling back to GitHub Releases..." -ForegroundColor DarkYellow
+            }
+
+            # Force per-machine installation for new installs too
+            if (Install-MsiFromUrl -Url $release.Url -AppName $app.Name -ProcessName $app.ProcessName -Version $release.Version) {
+                Write-Host "  -> Installation completed successfully via MSI ($($release.Asset))." -ForegroundColor Green
+                $successCount++
+            }
+            else {
+                Write-Host "  -> Installation failed for $($app.Name)." -ForegroundColor Red
+                $failCount++
+                $failedApps += $app.Name
+            }
         }
         else {
-            Write-Host "  -> Winget has the package but installation failed. Falling back to GitHub Releases..." -ForegroundColor DarkYellow
+            # Winget disabled: go straight to MSI
+            Write-Host "  -> Winget disabled: Installing directly via MSI from GitHub." -ForegroundColor Gray
+            if (Install-MsiFromUrl -Url $release.Url -AppName $app.Name -ProcessName $app.ProcessName -Version $release.Version) {
+                Write-Host "  -> Installation completed successfully via MSI ($($release.Asset))." -ForegroundColor Green
+                $successCount++
+            }
+            else {
+                Write-Host "  -> Installation failed for $($app.Name)." -ForegroundColor Red
+                $failCount++
+                $failedApps += $app.Name
+            }
         }
-
-        # Force per-machine installation for new installs too
-        if (Install-MsiFromUrl -Url $release.Url -AppName $app.Name -ProcessName $app.ProcessName) {
-            Write-Host "  -> Installation completed successfully via MSI ($($release.Asset))." -ForegroundColor Green
-            $successCount++
-        }
-        else {
-            Write-Host "  -> Installation failed for $($app.Name)." -ForegroundColor Red
-            $failCount++
-            $failedApps += $app.Name
-        }
-
-        $currentIndex++
-        continue
     }
 
     $currentIndex++
@@ -879,6 +1038,11 @@ if ($failedApps.Count -gt 0) {
 Write-Host "`nCache Statistics:" -ForegroundColor Cyan
 Write-Host "  GitHub API calls this run:  $script:apiCallCount" -ForegroundColor $(if ($script:apiCallCount -eq 0) { 'Green' } else { 'Gray' })
 Write-Host "  Cache hits this run:        $script:cacheHitCount" -ForegroundColor $(if ($script:cacheHitCount -gt 0) { 'Green' } else { 'Gray' })
+
+if ($script:usedPackages.Count -gt 0) {
+    Write-Host "`nMSI Packages Used/Stored:" -ForegroundColor Cyan
+    $script:usedPackages | ForEach-Object { Write-Host "  $($_)" -ForegroundColor Gray }
+}
 
 # List generated winget logs
 $wingetLogs = Get-ChildItem -Path $env:TEMP -Filter "*-winget.log" -ErrorAction SilentlyContinue
