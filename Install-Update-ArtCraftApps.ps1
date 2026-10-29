@@ -25,12 +25,105 @@
       This is deterministic, not intermittent: once the script has installed
       an app per-machine, winget can never upgrade it.
     - Informational pending-reboot check before processing begins.
+
+    New in v5:
+    - Local version cache (24h TTL) to reduce GitHub API calls
+    - Graceful degradation when API rate-limited
+
+    New in v6:
+    - Configurable cache location via $VersionCachePathOverride.
+    - Freshness is evaluated per cache entry (CachedAt) instead of once for
+      the whole file, so entries fetched at different times expire separately.
+    - A stale cache entry is still served if the GitHub lookup fails, instead
+      of failing the application outright.
+    - Cache writes go through a temporary file and a rename, so a reader never
+      sees a half-written file (matters when the cache sits on a share).
+    - API call / cache hit counters in the summary.
 #>
 
 $ProgressPreference = 'SilentlyContinue'
 try { [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12 } catch {}
 
 $gitHubUser = "storytold"
+
+# ======================= LOCAL CONFIGURATION =======================
+# Version cache location override.
+#
+#   Leave the value empty ('') to keep the cache file in the same folder as
+#   this script. Recommended for a standalone machine, or for a script that is
+#   copied onto every machine.
+#
+#   Set it to a path to keep the cache elsewhere - typically a shared folder,
+#   so that every machine in a lab reuses one set of GitHub lookups:
+#
+#       $VersionCachePathOverride = '\\fileserver\software\artcraft'
+#       $VersionCachePathOverride = '\\fileserver\software\artcraft\cache.json'
+#
+#   A value ending in ".json" is treated as the full cache file path. Any other
+#   value is treated as a folder and the default file name is appended to it.
+#
+#   If this variable is deleted or left blank, the script silently falls back
+#   to the script folder. No API keys or tokens are ever required.
+$VersionCachePathOverride = ''
+
+# How long a cached version lookup stays valid, in hours.
+$VersionCacheTTLHours = 24
+# ===================================================================
+
+$defaultCacheFileName = 'artcraft-version-cache.json'
+
+# ---------- Resolve the cache location ----------
+
+# Locate the folder this script lives in. $PSScriptRoot covers -File and
+# dot-sourcing; the fallbacks cover unusual hosts.
+$scriptDir = $PSScriptRoot
+if ([string]::IsNullOrWhiteSpace($scriptDir)) {
+    if ($MyInvocation.MyCommand.Path) {
+        $scriptDir = Split-Path -Parent -Path $MyInvocation.MyCommand.Path
+    }
+    elseif ($MyInvocation.MyCommand.Definition) {
+        $scriptDir = Split-Path -Parent -Path $MyInvocation.MyCommand.Definition
+    }
+    else {
+        $scriptDir = (Get-Location).Path
+    }
+}
+
+# Read the override defensively: it may have been removed from the script.
+$cacheOverride = $null
+$overrideVariable = Get-Variable -Name 'VersionCachePathOverride' -Scope Script -ErrorAction SilentlyContinue
+if ($overrideVariable) { $cacheOverride = $overrideVariable.Value }
+
+if (-not [string]::IsNullOrWhiteSpace($cacheOverride)) {
+    if ($cacheOverride -match '\.json$') {
+        $cacheFile = $cacheOverride
+    }
+    else {
+        $cacheFile = Join-Path $cacheOverride $defaultCacheFileName
+    }
+    $cacheSource = 'override'
+}
+else {
+    $cacheFile   = Join-Path $scriptDir $defaultCacheFileName
+    $cacheSource = 'script folder'
+}
+
+$cacheTTLHours = $VersionCacheTTLHours
+
+# Make sure the destination folder exists (relevant for the override case).
+$cacheDir = Split-Path -Parent -Path $cacheFile
+if ($cacheDir -and -not (Test-Path -LiteralPath $cacheDir)) {
+    try {
+        $null = New-Item -ItemType Directory -Path $cacheDir -Force -ErrorAction Stop
+    }
+    catch {
+        Write-Host "Warning: Cannot create cache folder '$cacheDir': $($_.Exception.Message)" -ForegroundColor DarkYellow
+    }
+}
+
+# Counters, reported in the summary.
+$script:apiCallCount  = 0
+$script:cacheHitCount = 0
 
 # Winget error code emitted when the underlying MSI fails.
 $WINGET_ERROR_MSI_INSTALL_FAILED = -1978335159   # 0x8A150049
@@ -52,6 +145,161 @@ $appDefs = @(
     "SoundCraft|ArtCraft.SoundCraft|soundcraft|SoundCraft.exe",
     "FigCraft|ArtCraft.FigCraft|figcraft|FigCraft.exe"
 )
+
+# ---------- Version cache ----------
+
+function Get-VersionCache {
+    <#
+        Reads the version cache file and returns it as a Hashtable keyed by
+        "owner/repo". Returns $null when the file is missing, empty or
+        unreadable.
+
+        ConvertFrom-Json produces PSCustomObject instances, which do not
+        support ContainsKey() or indexed assignment, so the object graph is
+        rebuilt as a Hashtable here.
+
+        Freshness is NOT decided here. Each entry carries its own CachedAt
+        stamp and is judged individually, so entries fetched at different
+        times expire independently.
+    #>
+    if (-not (Test-Path -LiteralPath $cacheFile)) { return $null }
+
+    try {
+        $raw = Get-Content -LiteralPath $cacheFile -Raw -ErrorAction Stop
+        if ([string]::IsNullOrWhiteSpace($raw)) { return $null }
+
+        $cacheData = $raw | ConvertFrom-Json -ErrorAction Stop
+        if (-not $cacheData.Versions) { return $null }
+
+        $table = @{}
+        foreach ($prop in $cacheData.Versions.PSObject.Properties) {
+            $table[$prop.Name] = $prop.Value
+        }
+        return $table
+    }
+    catch {
+        Write-Host "  -> Warning: Could not read version cache: $($_.Exception.Message)" -ForegroundColor DarkYellow
+        return $null
+    }
+}
+
+function Get-CacheFileTimestamp {
+    <# Last write time of the cache file, used as a fallback timestamp for
+       entries written by older versions of this script that did not record
+       a CachedAt value. #>
+    try {
+        return (Get-Item -LiteralPath $cacheFile -ErrorAction Stop).LastWriteTime
+    }
+    catch {
+        return $null
+    }
+}
+
+function Test-CacheEntryFresh {
+    param($Entry, $FallbackTimestamp)
+
+    if (-not $Entry) { return $false }
+
+    $timestamp = $FallbackTimestamp
+    if ($Entry.CachedAt) {
+        try {
+            $timestamp = [datetime]::Parse($Entry.CachedAt, [Globalization.CultureInfo]::InvariantCulture)
+        }
+        catch { }
+    }
+
+    if (-not $timestamp) { return $false }
+    return (((Get-Date) - $timestamp).TotalHours -le $cacheTTLHours)
+}
+
+function Set-VersionCache {
+    param([hashtable]$Versions)
+
+    try {
+        $cacheObj = [pscustomobject]@{
+            LastUpdated = (Get-Date).ToString('o')
+            Versions    = $Versions
+        }
+
+        $cacheJson = $cacheObj | ConvertTo-Json -Depth 6
+
+        # Write to a temporary file, then swap it in. A reader (or a second
+        # machine writing to a shared override path) therefore never observes
+        # a partially written cache file.
+        $tempFile = "$cacheFile.tmp"
+        Set-Content -LiteralPath $tempFile -Value $cacheJson -Encoding UTF8 -ErrorAction Stop
+        Move-Item -LiteralPath $tempFile -Destination $cacheFile -Force -ErrorAction Stop
+    }
+    catch {
+        Write-Host "  -> Warning: Could not save version cache: $($_.Exception.Message)" -ForegroundColor DarkYellow
+    }
+}
+
+function Get-GitHubRelease-Cached {
+    <#
+        Returns release info for owner/repo.
+
+        Order of preference:
+          1. A cache entry younger than $cacheTTLHours -> no API call at all.
+          2. A live GitHub API lookup                 -> result is cached.
+          3. A stale cache entry, if the lookup fails -> better than nothing.
+
+        The cache is what keeps a whole lab behind one NAT address comfortably
+        inside the 60 requests/hour unauthenticated GitHub API limit.
+    #>
+    param([string]$Owner, [string]$Repo)
+
+    $key = "$Owner/$Repo"
+
+    $cache         = Get-VersionCache
+    $fileTimestamp = Get-CacheFileTimestamp
+
+    $entry = $null
+    if ($cache -and $cache.ContainsKey($key)) { $entry = $cache[$key] }
+
+    if (Test-CacheEntryFresh -Entry $entry -FallbackTimestamp $fileTimestamp) {
+        $script:cacheHitCount++
+        Write-Host "  -> Cache HIT for $Repo (version $($entry.Version))" -ForegroundColor Gray
+        return [pscustomobject]@{
+            Version = $entry.Version
+            Url     = $entry.Url
+            Asset   = $entry.Asset
+        }
+    }
+
+    if ($entry) {
+        Write-Host "  -> Cache entry for $Repo is older than ${cacheTTLHours}h. Querying GitHub API..." -ForegroundColor Gray
+    }
+    else {
+        Write-Host "  -> Cache MISS for $Repo. Querying GitHub API..." -ForegroundColor Gray
+    }
+
+    $script:apiCallCount++
+    $release = Get-GitHubRelease -Owner $Owner -Repo $Repo
+
+    if (-not $release) {
+        if ($entry) {
+            Write-Host "  -> GitHub lookup failed. Falling back to stale cached entry ($($entry.Version))." -ForegroundColor DarkYellow
+            return [pscustomobject]@{
+                Version = $entry.Version
+                Url     = $entry.Url
+                Asset   = $entry.Asset
+            }
+        }
+        return $null
+    }
+
+    if (-not $cache) { $cache = @{} }
+    $cache[$key] = [pscustomobject]@{
+        Version  = $release.Version
+        Url      = $release.Url
+        Asset    = $release.Asset
+        CachedAt = (Get-Date).ToString('o')
+    }
+    Set-VersionCache -Versions $cache
+
+    return $release
+}
 
 # ---------- Helper functions ----------
 
@@ -88,7 +336,20 @@ function Get-GitHubRelease {
                                      -Headers $headers -TimeoutSec 45 -ErrorAction Stop
     }
     catch {
-        Write-Host "  -> GitHub API error: $($_.Exception.Message)" -ForegroundColor DarkYellow
+        $statusCode = $null
+        try {
+            if ($_.Exception.Response -and $_.Exception.Response.StatusCode) {
+                $statusCode = [int]$_.Exception.Response.StatusCode
+            }
+        }
+        catch { }
+
+        if ($statusCode -eq 403 -or $statusCode -eq 429) {
+            Write-Host "  -> GitHub API rate limit reached (HTTP $statusCode)." -ForegroundColor DarkYellow
+        }
+        else {
+            Write-Host "  -> GitHub API error: $($_.Exception.Message)" -ForegroundColor DarkYellow
+        }
         return $null
     }
 
@@ -398,9 +659,11 @@ foreach ($def in $appDefs) {
 
 if ($apps.Count -eq 0) { throw "No valid applications found in the definition list." }
 
-Write-Host "ArtCraft Suite Manager (Per-Machine Install v5)..." -ForegroundColor Cyan
+Write-Host "ArtCraft Suite Manager (Per-Machine Install v6 + Local Version Cache)..." -ForegroundColor Cyan
 Write-Host "Enforcing per-machine installation scope for all applications..." -ForegroundColor Gray
 Write-Host "Logs will be written to: $env:TEMP" -ForegroundColor Gray
+Write-Host "Version cache: $cacheFile" -ForegroundColor Gray
+Write-Host "  source: $cacheSource | TTL: ${cacheTTLHours}h" -ForegroundColor Gray
 
 if (Test-PendingReboot) {
     Write-Host "NOTE: A system reboot is pending. Some MSI installations may fail with 1603." -ForegroundColor DarkYellow
@@ -452,10 +715,12 @@ foreach ($app in $apps) {
         # Detect existing installation scope
         $existingInstall = Detect-ExistingScope -AppName $app.Name
 
-        # Check latest GitHub version FIRST
-        $release = Get-GitHubRelease -Owner $gitHubUser -Repo $app.Repo
+        # Release info comes from the local cache when it is fresh; the GitHub
+        # API is contacted only for missing or expired entries.
+        $release = Get-GitHubRelease-Cached -Owner $gitHubUser -Repo $app.Repo
+
         if (-not $release) {
-            Write-Host "  -> Could not fetch GitHub release info. Assuming current version OK." -ForegroundColor Gray
+            Write-Host "  -> Could not fetch GitHub release info. Assuming current version OK." -ForegroundColor DarkYellow
             $successCount++
             $currentIndex++
             continue
@@ -546,8 +811,10 @@ foreach ($app in $apps) {
     else {
         Write-Host "  -> State: Missing. Starting installation..." -ForegroundColor Blue
 
-        # Check latest GitHub version FIRST before attempting install
-        $release = Get-GitHubRelease -Owner $gitHubUser -Repo $app.Repo
+        # Release info comes from the local cache when it is fresh; the GitHub
+        # API is contacted only for missing or expired entries.
+        $release = Get-GitHubRelease-Cached -Owner $gitHubUser -Repo $app.Repo
+
         if (-not $release) {
             Write-Host "  -> Could not determine latest version. Cannot proceed with installation." -ForegroundColor Red
             $failCount++
@@ -609,6 +876,10 @@ if ($failedApps.Count -gt 0) {
     Write-Host "  Failed apps: $($failedApps -join ', ')" -ForegroundColor Red
 }
 
+Write-Host "`nCache Statistics:" -ForegroundColor Cyan
+Write-Host "  GitHub API calls this run:  $script:apiCallCount" -ForegroundColor $(if ($script:apiCallCount -eq 0) { 'Green' } else { 'Gray' })
+Write-Host "  Cache hits this run:        $script:cacheHitCount" -ForegroundColor $(if ($script:cacheHitCount -gt 0) { 'Green' } else { 'Gray' })
+
 # List generated winget logs
 $wingetLogs = Get-ChildItem -Path $env:TEMP -Filter "*-winget.log" -ErrorAction SilentlyContinue
 if ($wingetLogs) {
@@ -616,7 +887,7 @@ if ($wingetLogs) {
     $wingetLogs | ForEach-Object { Write-Host "  $($_.FullName)" -ForegroundColor Gray }
 }
 
-Write-Host "Architecture sync complete." -ForegroundColor Cyan
+Write-Host "`nArchitecture sync complete." -ForegroundColor Cyan
 
 if ($failCount -gt 0) {
     exit 1
