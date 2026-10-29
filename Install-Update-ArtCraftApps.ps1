@@ -57,6 +57,12 @@
       can never survive as a reusable package.
     - If the script folder is not writable, the download folder falls back to
       $env:TEMP automatically.
+
+    New in v8:
+    - MSI package download directory now respects $VersionCachePathOverride.
+      When this variable is set, both the version cache AND the MSI packages
+      are stored in the same location (either the path itself or the folder
+      containing it if the path ends in .json).
 #>
 
 $ProgressPreference = 'SilentlyContinue'
@@ -97,9 +103,11 @@ $UseWinget = $false
 #
 #   A value ending in ".json" is treated as the full cache file path. Any other
 #   value is treated as a folder and the default file name is appended to it.
+#   NOTE: The same path (or its folder) is now ALSO used for MSI package storage.
 #
 #   If this variable is deleted or left blank, the script silently falls back
-#   to the script folder. No API keys or tokens are ever required.
+#   to the script folder for both cache and MSI packages. No API keys or tokens
+#   are ever required.
 $VersionCachePathOverride = ''
 
 # How long a cached version lookup stays valid, in hours.
@@ -146,28 +154,6 @@ if ($wingetVariable -and $null -ne $wingetVariable.Value) {
     }
 }
 
-# ---------- Resolve the MSI download folder ----------
-# Downloaded packages live next to this script so that a later run finds them
-# already in place and skips the download. If that folder is not writable (for
-# example the script sits on a locked-down share), fall back to $env:TEMP.
-$downloadDir = $scriptDir
-$downloadDirWritable = $false
-if ($downloadDir -and (Test-Path -LiteralPath $downloadDir)) {
-    try {
-        $writeProbe = Join-Path $downloadDir '.artcraft-write-probe.tmp'
-        Set-Content -LiteralPath $writeProbe -Value 'probe' -Encoding ASCII -ErrorAction Stop
-        Remove-Item -LiteralPath $writeProbe -Force -ErrorAction SilentlyContinue
-        $downloadDirWritable = $true
-    }
-    catch {
-        $downloadDirWritable = $false
-    }
-}
-if (-not $downloadDirWritable) {
-    Write-Host "Warning: '$downloadDir' is not writable. MSI packages will be stored in $env:TEMP instead." -ForegroundColor DarkYellow
-    $downloadDir = $env:TEMP
-}
-
 # ---------- Resolve the cache location ----------
 
 # Read the override defensively: it may have been removed from the script.
@@ -200,6 +186,30 @@ if ($cacheDir -and -not (Test-Path -LiteralPath $cacheDir)) {
     catch {
         Write-Host "Warning: Cannot create cache folder '$cacheDir': $($_.Exception.Message)" -ForegroundColor DarkYellow
     }
+}
+
+# ---------- Resolve the MSI download folder ----------
+# MSI packages are stored in the same location as the version cache (when
+# overridden) or in the script folder (when using default). This allows
+# subsequent runs to reuse downloaded packages without re-fetching them.
+$downloadDir = $cacheDir
+$downloadDirWritable = $false
+
+if ($downloadDir -and (Test-Path -LiteralPath $downloadDir)) {
+    try {
+        $writeProbe = Join-Path $downloadDir '.artcraft-write-probe.tmp'
+        Set-Content -LiteralPath $writeProbe -Value 'probe' -Encoding ASCII -ErrorAction Stop
+        Remove-Item -LiteralPath $writeProbe -Force -ErrorAction SilentlyContinue
+        $downloadDirWritable = $true
+    }
+    catch {
+        $downloadDirWritable = $false
+    }
+}
+
+if (-not $downloadDirWritable) {
+    Write-Host "Warning: '$downloadDir' is not writable. MSI packages will be stored in $env:TEMP instead." -ForegroundColor DarkYellow
+    $downloadDir = $env:TEMP
 }
 
 # Counters, reported in the summary.
@@ -767,7 +777,7 @@ foreach ($def in $appDefs) {
 
 if ($apps.Count -eq 0) { throw "No valid applications found in the definition list." }
 
-Write-Host "ArtCraft Suite Manager (Per-Machine Install v7 + Local Version Cache)..." -ForegroundColor Cyan
+Write-Host "ArtCraft Suite Manager (Per-Machine Install v8 + Unified MSI/Cache Location)..." -ForegroundColor Cyan
 Write-Host "Enforcing per-machine installation scope for all applications..." -ForegroundColor Gray
 Write-Host "Winget usage: $(if ($wingetEnabled) { 'ENABLED' } else { 'DISABLED' })" -ForegroundColor Gray
 Write-Host "Logs will be written to: $env:TEMP" -ForegroundColor Gray
