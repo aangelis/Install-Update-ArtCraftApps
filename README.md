@@ -34,7 +34,7 @@ Based on the answers it then does exactly one of four things: **skip**, **upgrad
 ## Managed applications
 
 | App | winget ID | GitHubUser | GitHub repo | Executable |
-|---|---|---|---|
+|---|---|---|---|---|
 | ArtCraftLauncher | `ArtCraft.ArtCraftLauncher` | `storytold` | `craft-launcher` | `ArtCraftLauncher.exe` |
 | PhotoCraft | `ArtCraft.PhotoCraft` | `storytold` | `photocraft` | `PhotoCraft.exe` |
 | VectorCraft | `ArtCraft.VectorCraft` | `storytold` | `vectorcraft` | `VectorCraft.exe` |
