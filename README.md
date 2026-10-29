@@ -108,14 +108,14 @@ This allows you to either keep a per-machine cache or share one cache file acros
 
 When winget can't do the job, the script falls back to the release asset:
 
-1. Downloads to `%TEMP%\<AppName>-bootstrap.msi`
+1. If an upgrade or fresh install is needed, the script checks if the versioned installer (e.g., `PhotoCraft-1.2.0.msi`) is already present in the target cache folder (`$VersionCachePathOverride` or the script folder).
 2. **Validates the file** by reading its first four bytes and checking for the OLE compound-document magic number `D0 CF 11 E0` — this catches the classic failure mode where an error page or redirect gets saved as `.msi`
-3. Terminates any running instance of the app to avoid file locks
-4. Runs `msiexec /i "<msi>" /qn /norestart /L*v "<log>"`
-5. Interprets the exit code properly (see below)
-6. Deletes the downloaded MSI
-
-Leftover Craft MSI files elsewhere on the system are deliberately **not** cleaned up — they may still be needed for repairs.
+3. If present, downloading is skipped completely.
+5. If missing, it downloads to `.part`, validates the file signature (`D0 CF 11 E0`), and renames it.
+6. Terminates any running instance of the app to avoid file locks
+7. Runs `msiexec /i "<msi>" /qn /norestart /L*v "<log>"`
+8. Interprets the exit code properly (see below)
+9. Keeps the downloaded MSI for future usage
 
 ### 5. Exit-code handling
 
@@ -202,6 +202,14 @@ Change the GitHub account that hosts the releases:
 $gitHubUser = "storytold"
 ```
 
+### Winget Toggle (`$UseWinget`)
+
+```powershell
+$UseWinget = $false
+```
+- `$false` *(Default)*: Operates purely via direct GitHub MSI downloads. Skips `winget` queries entirely for faster execution and guaranteed per-machine installation scope (`ALLUSERS=1`).
+- `$true`: Enables winget-first operations where appropriate (with automatic fallback to MSI for machine-scoped packages).
+  
 ### Application definitions
 
 Add or remove apps by editing the definition array. The format is
@@ -217,9 +225,9 @@ $appDefs = @(
 
 Malformed entries (wrong field count or empty fields) are skipped with a warning instead of crashing the run.
 
-### Version cache location
+### Cache & MSI Storage Location (`$VersionCachePathOverride`)
 
-By default, the version cache sits next to the script. To move it to a shared folder for lab-wide coordination:
+By default, the version cache and MSI storage sits next to the script. To move it to a shared folder for lab-wide coordination:
 
 ```powershell
 # Store in a custom folder (default filename appended)
@@ -234,7 +242,7 @@ $VersionCachePathOverride = ''
 
 If the folder doesn't exist, it will be created automatically. Multiple machines pointing to the same cache file means only one machine does the GitHub lookups; the rest reuse the cached versions until the 24-hour expiry.
 
-### Cache TTL
+### Cache TTL (`$VersionCacheTTLHours`)
 
 How long a cached version lookup stays valid (in hours):
 ```powershell
