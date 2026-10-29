@@ -63,12 +63,15 @@
       When this variable is set, both the version cache AND the MSI packages
       are stored in the same location (either the path itself or the folder
       containing it if the path ends in .json).
+
+    New in v9:
+    - Enhanced error tracking and summary diagnostics for per-application execution results.
+    - Expanded individual repository mapping support (e.g., SolidCraft under tangency-labs).
+
 #>
 
 $ProgressPreference = 'SilentlyContinue'
 try { [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12 } catch {}
-
-$gitHubUser = "storytold"
 
 # ======================= LOCAL CONFIGURATION =======================
 # ---- Winget switch ----
@@ -222,22 +225,23 @@ $script:usedPackages = @()
 # Winget error code emitted when the underlying MSI fails.
 $WINGET_ERROR_MSI_INSTALL_FAILED = -1978335159   # 0x8A150049
 
-# Format: Name|WingetId|GitHubRepo|ExeName
+# Format: Name|WingetId|GitHubUser|GitHubRepo|ExeName
 $appDefs = @(
-    "ArtCraftLauncher|ArtCraft.ArtCraftLauncher|craft-launcher|ArtCraftLauncher.exe",
-    "PhotoCraft|ArtCraft.PhotoCraft|photocraft|PhotoCraft.exe",
-    "VectorCraft|ArtCraft.VectorCraft|vectorcraft|VectorCraft.exe",
-    "PdfCraft|ArtCraft.PdfCraft|pdfcraft|PdfCraft.exe",
-    "WordCraft|ArtCraft.WordCraft|wordcraft|WordCraft.exe",
-    "GridCraft|ArtCraft.GridCraft|gridcraft|GridCraft.exe",
-    "LightCraft|ArtCraft.LightCraft|lightcraft|LightCraft.exe",
-    "FilmCraft|ArtCraft.FilmCraft|filmcraft|FilmCraft.exe",
-    "DesignCraft|ArtCraft.DesignCraft|designcraft|DesignCraft.exe",
-    "EffectCraft|ArtCraft.EffectCraft|effectcraft|EffectCraft.exe",
-    "DeckCraft|ArtCraft.DeckCraft|deckcraft|DeckCraft.exe",
-    "CADCraft|ArtCraft.CadCraft|cadcraft|CADCraft.exe",
-    "SoundCraft|ArtCraft.SoundCraft|soundcraft|SoundCraft.exe",
-    "FigCraft|ArtCraft.FigCraft|figcraft|FigCraft.exe"
+    "ArtCraftLauncher|ArtCraft.ArtCraftLauncher|storytold|craft-launcher|ArtCraftLauncher.exe",
+    "PhotoCraft|ArtCraft.PhotoCraft|storytold|photocraft|PhotoCraft.exe",
+    "VectorCraft|ArtCraft.VectorCraft|storytold|vectorcraft|VectorCraft.exe",
+    "PdfCraft|ArtCraft.PdfCraft|storytold|pdfcraft|PdfCraft.exe",
+    "WordCraft|ArtCraft.WordCraft|storytold|wordcraft|WordCraft.exe",
+    "GridCraft|ArtCraft.GridCraft|storytold|gridcraft|GridCraft.exe",
+    "LightCraft|ArtCraft.LightCraft|storytold|lightcraft|LightCraft.exe",
+    "FilmCraft|ArtCraft.FilmCraft|storytold|filmcraft|FilmCraft.exe",
+    "DesignCraft|ArtCraft.DesignCraft|storytold|designcraft|DesignCraft.exe",
+    "EffectCraft|ArtCraft.EffectCraft|storytold|effectcraft|EffectCraft.exe",
+    "DeckCraft|ArtCraft.DeckCraft|storytold|deckcraft|DeckCraft.exe",
+    "CADCraft|ArtCraft.CadCraft|storytold|cadcraft|CADCraft.exe",
+    "SoundCraft|ArtCraft.SoundCraft|storytold|soundcraft|SoundCraft.exe",
+    "FigCraft|ArtCraft.FigCraft|storytold|figcraft|FigCraft.exe",
+    "SolidCraft|ArtCraft.SolidCraft|tangency-labs|solidcraft|SolidCraft.exe"
 )
 
 # ---------- Version cache ----------
@@ -761,16 +765,17 @@ function Try-WingetInstall {
 $apps = @()
 foreach ($def in $appDefs) {
     $parts = $def.Split('|')
-    if ($parts.Count -ne 4 -or ($parts | Where-Object { [string]::IsNullOrWhiteSpace($_) })) {
+    if ($parts.Count -ne 5 -or ($parts | Where-Object { [string]::IsNullOrWhiteSpace($_) })) {
         Write-Warning "Skipping malformed entry: '$def'"
         continue
     }
     $apps += [pscustomobject]@{
         Name        = $parts[0]
         ID          = $parts[1]
-        Repo        = $parts[2]
-        ExeName     = $parts[3]
-        ProcessName = ($parts[3] -replace '\.exe$', '')
+        User        = $parts[2]
+        Repo        = $parts[3]
+        ExeName     = $parts[4]
+        ProcessName = ($parts[4] -replace '\.exe$', '')
         NormName    = Normalize-Name -Name $parts[0]
     }
 }
@@ -845,7 +850,7 @@ foreach ($app in $apps) {
 
         # Release info comes from the local cache when it is fresh; the GitHub
         # API is contacted only for missing or expired entries.
-        $release = Get-GitHubRelease-Cached -Owner $gitHubUser -Repo $app.Repo
+        $release = Get-GitHubRelease-Cached -Owner $app.User -Repo $app.Repo
 
         if (-not $release) {
             Write-Host "  -> Could not fetch GitHub release info. Assuming current version OK." -ForegroundColor DarkYellow
@@ -970,7 +975,7 @@ foreach ($app in $apps) {
 
         # Release info comes from the local cache when it is fresh; the GitHub
         # API is contacted only for missing or expired entries.
-        $release = Get-GitHubRelease-Cached -Owner $gitHubUser -Repo $app.Repo
+        $release = Get-GitHubRelease-Cached -Owner $app.User -Repo $app.Repo
 
         if (-not $release) {
             Write-Host "  -> Could not determine latest version. Cannot proceed with installation." -ForegroundColor Red
