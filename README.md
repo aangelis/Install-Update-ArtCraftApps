@@ -157,7 +157,7 @@ Set-ExecutionPolicy -Scope Process Bypass
 .\Install-Update-ArtCraftApps.ps1
 ```
 
-The script is fully unattended: it prints a progress line per app (`[3/14] Processing VectorCraft...`) and finishes with a summary such as:
+The script is fully unattended: it prints a progress line per app (`[3/15] Processing VectorCraft...`) and finishes with a summary such as:
 
 ```
 ========================================
