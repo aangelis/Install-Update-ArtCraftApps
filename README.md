@@ -162,8 +162,16 @@ The script is fully unattended: it prints a progress line per app (`[3/14] Proce
 ```
 ========================================
 Summary:
-  Successful: 14 / 14
-  Failed:     0 / 14
+  Successful: 15 / 15
+  Failed:     0 / 15
+
+Cache Statistics:
+  GitHub API calls this run:  15
+  Cache hits this run:        0
+
+MSI Packages Used/Stored:
+  SolidCraft-0.27.1.msi
+
 Architecture sync complete.
 ```
 
