@@ -69,7 +69,7 @@
     - Expanded individual repository mapping support (e.g., SolidCraft under tangency-labs).
 
     New in v10:
-    - New apps added (MaterialCraft, Texturecraft and Craft Anything).
+    - New apps added (MaterialCraft, TextureCraft and Craft Anything).
 
 #>
 
