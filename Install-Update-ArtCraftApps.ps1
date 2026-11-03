@@ -245,9 +245,9 @@ $appDefs = @(
     "SoundCraft|ArtCraft.SoundCraft|storytold|soundcraft|SoundCraft.exe",
     "FigCraft|ArtCraft.FigCraft|storytold|figcraft|FigCraft.exe",
     "SolidCraft|ArtCraft.SolidCraft|tangency-labs|solidcraft|SolidCraft.exe",
-    "MaterialCraft|ArtCraft.SolidCraft|storytold|materialcraft|MaterialCraft.exe",
-    "TextureCraft|ArtCraft.SolidCraft|storytold|texturecraft|TextureCraft.exe",
-    "CraftAnything|ArtCraft.SolidCraft|storytold|craft-anything|Craft-Anything.exe"
+    "MaterialCraft|ArtCraft.MaterialCraft|storytold|materialcraft|MaterialCraft.exe",
+    "TextureCraft|ArtCraft.TextureCraft|storytold|texturecraft|TextureCraft.exe",
+    "CraftAnything|ArtCraft.Craft-Anything|storytold|craft-anything|Craft-Anything.exe"
 )
 
 # ---------- Version cache ----------
