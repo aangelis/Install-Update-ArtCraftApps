@@ -48,7 +48,11 @@ Based on the answers it then does exactly one of four things: **skip**, **upgrad
 | DeckCraft | `ArtCraft.DeckCraft` | `storytold` | `deckcraft` | `DeckCraft.exe` |
 | CADCraft | `ArtCraft.CadCraft` | `storytold` | `cadcraft` | `CADCraft.exe` |
 | SoundCraft | `ArtCraft.SoundCraft` | `storytold` | `soundcraft` | `SoundCraft.exe` |
-| FigCraft | `ArtCraft.FigCraft` | `tangency-labs` | `figcraft` | `FigCraft.exe` |
+| FigCraft | `ArtCraft.FigCraft` | `storytold` | `figcraft` | `FigCraft.exe` |
+| SolidCraft | `ArtCraft.SolidCraft` | `tangency-labs` | `solidcraft` | `SolidCraft.exe` |
+| MaterialCraft | `ArtCraft.MaterialCraft` | `storytold` | `materialcraft` | `MaterialCraft.exe` |
+| TextureCraft | `ArtCraft.TextureCraft` | `storytold` | `texturecraft` | `TextureCraft.exe` |
+| Craft-Anything | `ArtCraft.FigCraft` | `storytold` | `craft-anything` | `Craft-Anything.exe` |
 
 Adding another app is a one-line change — see [Configuration](#configuration).
 
@@ -157,20 +161,23 @@ Set-ExecutionPolicy -Scope Process Bypass
 .\Install-Update-ArtCraftApps.ps1
 ```
 
-The script is fully unattended: it prints a progress line per app (`[3/15] Processing VectorCraft...`) and finishes with a summary such as:
+The script is fully unattended: it prints a progress line per app (`[3/18] Processing VectorCraft...`) and finishes with a summary such as:
 
 ```
 ========================================
 Summary:
-  Successful: 15 / 15
-  Failed:     0 / 15
+  Successful: 18 / 18
+  Failed:     0 / 18
 
 Cache Statistics:
-  GitHub API calls this run:  15
-  Cache hits this run:        0
+  GitHub API calls this run:  3
+  Cache hits this run:        15
 
 MSI Packages Used/Stored:
-  SolidCraft-0.27.1.msi
+  ArtCraftLauncher-0.14.0.msi
+  MaterialCraft-0.1.0.msi
+  TextureCraft-0.3.0.msi
+  CraftAnything-0.3.0.msi
 
 Architecture sync complete.
 ```
