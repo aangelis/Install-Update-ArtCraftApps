@@ -52,7 +52,7 @@ Based on the answers it then does exactly one of four things: **skip**, **upgrad
 | SolidCraft | `ArtCraft.SolidCraft` | `tangency-labs` | `solidcraft` | `SolidCraft.exe` |
 | MaterialCraft | `ArtCraft.MaterialCraft` | `storytold` | `materialcraft` | `MaterialCraft.exe` |
 | TextureCraft | `ArtCraft.TextureCraft` | `storytold` | `texturecraft` | `TextureCraft.exe` |
-| Craft-Anything | `ArtCraft.FigCraft` | `storytold` | `craft-anything` | `Craft-Anything.exe` |
+| Craft-Anything | `ArtCraft.Craft-Anything` | `storytold` | `craft-anything` | `Craft-Anything.exe` |
 
 Adding another app is a one-line change — see [Configuration](#configuration).
 
