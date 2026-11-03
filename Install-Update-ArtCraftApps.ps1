@@ -68,6 +68,9 @@
     - Enhanced error tracking and summary diagnostics for per-application execution results.
     - Expanded individual repository mapping support (e.g., SolidCraft under tangency-labs).
 
+    New in v10:
+    - New apps added (MaterialCraft, Texturecraft and Craft Anything).
+
 #>
 
 $ProgressPreference = 'SilentlyContinue'
@@ -241,7 +244,10 @@ $appDefs = @(
     "CADCraft|ArtCraft.CadCraft|storytold|cadcraft|CADCraft.exe",
     "SoundCraft|ArtCraft.SoundCraft|storytold|soundcraft|SoundCraft.exe",
     "FigCraft|ArtCraft.FigCraft|storytold|figcraft|FigCraft.exe",
-    "SolidCraft|ArtCraft.SolidCraft|tangency-labs|solidcraft|SolidCraft.exe"
+    "SolidCraft|ArtCraft.SolidCraft|tangency-labs|solidcraft|SolidCraft.exe",
+    "MaterialCraft|ArtCraft.SolidCraft|storytold|materialcraft|MaterialCraft.exe",
+    "TextureCraft|ArtCraft.SolidCraft|storytold|texturecraft|TextureCraft.exe",
+    "CraftAnything|ArtCraft.SolidCraft|storytold|craft-anything|Craft-Anything.exe"
 )
 
 # ---------- Version cache ----------
