@@ -126,7 +126,8 @@ When winget can't do the job, the script falls back to the release asset:
 | Code | Meaning | Behaviour |
 |---|---|---|
 | `0` | Success | Continue |
-| `1` | Failure, Administrator privileges required | Aborts with a clear message that  elevation is missing |
+| `1` | Failure | At least one app failed (the names are listed in the summary) |
+| `2` | Failure, Administrator privileges required | Aborts with a clear message that  elevation is missing |
 | `3010` | Success, reboot required | Counted as success, warning printed |
 | `1641` | Success, reboot initiated | Counted as success, warning printed |
 | `1618` | Another installation in progress | Waits 15 s and retries once |
