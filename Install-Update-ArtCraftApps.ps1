@@ -79,6 +79,10 @@
       profile (e.g. C:\Users\Admin\AppData\Local\ArtCraft Launcher).
     - All other applications keep the forced per-machine (ALLUSERS=1) path.
 
+    New in v12:
+    - Requires Administrator privileges; aborts with a clear message and the
+      exact re-run command if elevation is missing.
+
 #>
 
 $ProgressPreference = 'SilentlyContinue'
@@ -105,6 +109,39 @@ if ([string]::IsNullOrWhiteSpace($scriptDir)) {
         $scriptDir = (Get-Location).Path
     }
 }
+
+# ---------- Require administrator privileges ----------
+function Test-IsAdministrator {
+    $identity  = [Security.Principal.WindowsIdentity]::GetCurrent()
+    $principal = New-Object Security.Principal.WindowsPrincipal($identity)
+    return $principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
+}
+
+if (-not (Test-IsAdministrator)) {
+    $scriptPath = $MyInvocation.MyCommand.Path
+    if ([string]::IsNullOrWhiteSpace($scriptPath)) {
+        $scriptPath = Join-Path $scriptDir 'Install-Update-ArtCraftApps.ps1'
+    }
+
+    Write-Host ""
+    Write-Host "ERROR: This script must be run with Administrator privileges." -ForegroundColor Red
+    Write-Host ""
+    Write-Host "Reason: it installs MSI packages per-machine (ALLUSERS=1) and modifies" -ForegroundColor Yellow
+    Write-Host "        HKLM uninstall keys, which requires elevation." -ForegroundColor Yellow
+    Write-Host ""
+    Write-Host "Re-run it from an elevated PowerShell window with:" -ForegroundColor Cyan
+    Write-Host ""
+    Write-Host "    powershell.exe -ExecutionPolicy Bypass -File `"$scriptPath`"" -ForegroundColor White
+    Write-Host ""
+    Write-Host "To open an elevated PowerShell quickly, right-click PowerShell and choose" -ForegroundColor Gray
+    Write-Host "'Run as administrator', or run:" -ForegroundColor Gray
+    Write-Host ""
+    Write-Host "    Start-Process powershell -Verb RunAs -ArgumentList '-ExecutionPolicy Bypass -File `"$scriptPath`"'" -ForegroundColor White
+    Write-Host ""
+    exit 1
+}
+
+Write-Host "Running with Administrator privileges." -ForegroundColor Green
 
 # ---------- Resolve the winget switch ----------
 $wingetEnabled = $false
@@ -554,7 +591,7 @@ function Install-MsiFromUrl {
     return $false
 }
 
-# ---------- NEW: Launcher-specific helpers ----------
+# ---------- Launcher-specific helpers ----------
 function Get-LauncherAdminInstallPath {
     $candidates = @()
     $usersRoot = 'C:\Users'
@@ -741,7 +778,7 @@ foreach ($def in $appDefs) {
 if ($apps.Count -eq 0) { throw "No valid applications found in the definition list." }
 
 # ---------- HEADER ----------
-Write-Host "ArtCraft Suite Manager (Per-Machine Apps + Per-User Launcher v11)..." -ForegroundColor Cyan
+Write-Host "ArtCraft Suite Manager (Per-Machine Apps + Per-User Launcher v12)..." -ForegroundColor Cyan
 Write-Host "Other apps: forced per-machine (ALLUSERS=1). Launcher: per-user." -ForegroundColor Gray
 Write-Host "Winget usage: $(if ($wingetEnabled) { 'ENABLED' } else { 'DISABLED' })" -ForegroundColor Gray
 Write-Host "Logs will be written to: $env:TEMP" -ForegroundColor Gray
@@ -1061,6 +1098,3 @@ Write-Host "`nArchitecture sync complete." -ForegroundColor Cyan
 
 if ($failCount -gt 0) { exit 1 }
 exit 0
-
-
-
