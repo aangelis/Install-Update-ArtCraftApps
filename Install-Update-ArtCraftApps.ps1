@@ -138,7 +138,7 @@ if (-not (Test-IsAdministrator)) {
     Write-Host ""
     Write-Host "    Start-Process powershell -Verb RunAs -ArgumentList '-ExecutionPolicy Bypass -File `"$scriptPath`"'" -ForegroundColor White
     Write-Host ""
-    exit 1
+    exit 2
 }
 
 Write-Host "Running with Administrator privileges." -ForegroundColor Green
