@@ -146,7 +146,7 @@ Combined with the local cache, this keeps unauthenticated API usage well within 
 - Windows PowerShell 5.1+ (works in PowerShell 7 too)
 - [winget](https://aka.ms/getwinget) / App Installer — strongly recommended; without it the script falls back to MSI-only operation
 - Internet access to `api.github.com` and GitHub release assets
-- An **elevated** shell is recommended: machine-wide MSI installs and `HKLM` registry reads generally require administrator rights
+- An **elevated** shell is required: machine-wide MSI installs and `HKLM` registry reads generally require administrator rights
 
 ## Usage
 
