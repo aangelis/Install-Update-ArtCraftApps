@@ -83,6 +83,20 @@
     - Requires Administrator privileges; aborts with a clear message and the
       exact re-run command if elevation is missing.
 
+    New in v13:
+    - Launcher detection hardened:
+      * Any .exe whose name contains "launcher" is recognised, so renamed
+        builds are still detected in the wrong (Admin) path.
+      * Test-LauncherPresent verifies the file exists on disk before
+        trusting a registry entry, so a stale uninstall entry no longer
+        makes the script think the Launcher is installed.
+      * Get-LauncherInstalledVersion returns a version only when the
+        executable is actually present.
+      * Pre-flight removes the wrong folder even if the MSI uninstall
+        fails, and prunes the empty parent folder.
+      * Post-install verification fails the app if no exe appears in the
+        correct per-user location.
+
 #>
 
 $ProgressPreference = 'SilentlyContinue'
@@ -593,44 +607,120 @@ function Install-MsiFromUrl {
 
 # ---------- Launcher-specific helpers ----------
 function Get-LauncherAdminInstallPath {
+    <#
+        Scans every user profile for a Launcher folder that is NOT the
+        correct per-user location. Two known wrong locations exist:
+          * %LOCALAPPDATA%\ArtCraft Launcher            (old Admin install)
+          * %LOCALAPPDATA%\Programs\ArtCraft\Launcher  (old script assumption)
+        The correct location is %LOCALAPPDATA%\Programs\ArtCraft Launcher
+        (single folder name with a space) and is skipped on purpose.
+        A folder counts as a Launcher install if it contains any executable
+        whose name contains "launcher" (case-insensitive), so renamed
+        builds are still detected.
+    #>
+    $correctDir = Get-LauncherCorrectInstallPath
+
     $candidates = @()
     $usersRoot = 'C:\Users'
     if (Test-Path -LiteralPath $usersRoot) {
-        $candidates = Get-ChildItem -LiteralPath $usersRoot -Directory -ErrorAction SilentlyContinue |
-            ForEach-Object { Join-Path $_.FullName 'AppData\Local\ArtCraft Launcher' }
+        Get-ChildItem -LiteralPath $usersRoot -Directory -ErrorAction SilentlyContinue |
+            ForEach-Object {
+                $profileRoot = $_.FullName
+                $candidates += Join-Path $profileRoot 'AppData\Local\ArtCraft Launcher'
+                $candidates += Join-Path $profileRoot 'AppData\Local\Programs\ArtCraft\Launcher'
+            }
     }
     $candidates += Join-Path $env:LOCALAPPDATA 'ArtCraft Launcher'
+    $candidates += Join-Path $env:LOCALAPPDATA 'Programs\ArtCraft\Launcher'
 
     foreach ($path in $candidates) {
+        # Never flag the real correct location as "wrong".
+        if ($path -ieq $correctDir) { continue }
         if (Test-Path -LiteralPath $path) {
-            $exe = Join-Path $path 'artcraft-launcher.exe'
-            if (Test-Path -LiteralPath $exe) { return $path }
+            $exe = Get-ChildItem -LiteralPath $path -Filter '*.exe' -File -ErrorAction SilentlyContinue |
+                Where-Object { $_.Name -match 'launcher' } |
+                Select-Object -First 1
+            if ($exe) { return $path }
         }
     }
     return $null
 }
 
 function Get-LauncherCorrectInstallPath {
-    return (Join-Path $env:LOCALAPPDATA 'Programs\ArtCraft\Launcher')
+    return (Join-Path $env:LOCALAPPDATA 'Programs\ArtCraft Launcher')
 }
 
 function Test-LauncherPresent {
-    $correct = Join-Path (Get-LauncherCorrectInstallPath) 'artcraft-launcher.exe'
-    if (Test-Path -LiteralPath $correct) { return $correct }
+    <#
+        Returns the full path to a working Launcher executable, or $null.
+        Verifies that the file actually exists on disk before trusting
+        registry entries, so a stale uninstall entry does not make the
+        script think the Launcher is installed.
+    #>
+    # 1. Preferred: the correct per-user location.
+    $correctDir = Get-LauncherCorrectInstallPath
+    if (Test-Path -LiteralPath $correctDir) {
+        $exe = Get-ChildItem -LiteralPath $correctDir -Filter '*.exe' -File -ErrorAction SilentlyContinue |
+            Where-Object { $_.Name -match 'launcher' } |
+            Select-Object -First 1
+        if ($exe) { return $exe.FullName }
+    }
 
+    # 2. Legacy paths that older script versions may have created. These are
+    #    NOT the correct location, but an exe there is still a real install
+    #    that the caller may want to upgrade/clean up.
+    $legacyDirs = @(
+        (Join-Path $env:LOCALAPPDATA 'ArtCraft Launcher'),
+        (Join-Path $env:LOCALAPPDATA 'Programs\ArtCraft\Launcher')
+    )
+    foreach ($dir in $legacyDirs) {
+        if (Test-Path -LiteralPath $dir) {
+            $exe = Get-ChildItem -LiteralPath $dir -Filter '*.exe' -File -ErrorAction SilentlyContinue |
+                Where-Object { $_.Name -match 'launcher' } |
+                Select-Object -First 1
+            if ($exe) { return $exe.FullName }
+        }
+    }
+
+    # 3. Fallback: registry entry, but only if the exe it points to
+    #    actually exists on disk.
     $roots = @(
         'HKCU:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\*',
         'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\*',
         'HKLM:\SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall\*'
     )
-    $entry = Get-ItemProperty $roots -ErrorAction SilentlyContinue |
+    $entries = Get-ItemProperty $roots -ErrorAction SilentlyContinue |
         Where-Object {
             $_.DisplayName -and
-            ((Normalize-Name -Name $_.DisplayName) -like '*artcraftlauncher*')
-        } | Select-Object -First 1
-    if ($entry -and $entry.InstallLocation) {
-        $exe = Join-Path $entry.InstallLocation 'artcraft-launcher.exe'
-        if (Test-Path -LiteralPath $exe) { return $exe }
+            ((Normalize-Name -Name $_.DisplayName) -like '*artcraftlauncher*') -and
+            -not [string]::IsNullOrWhiteSpace($_.InstallLocation)
+        }
+    foreach ($entry in $entries) {
+        if (Test-Path -LiteralPath $entry.InstallLocation) {
+            $exe = Get-ChildItem -LiteralPath $entry.InstallLocation -Filter '*.exe' -File -ErrorAction SilentlyContinue |
+                Where-Object { $_.Name -match 'launcher' } |
+                Select-Object -First 1
+            if ($exe) { return $exe.FullName }
+        }
+    }
+
+    return $null
+}
+
+function Get-LauncherInstalledVersion {
+    <#
+        Returns the installed Launcher version ONLY when the executable
+        actually exists on disk. If the registry has a stale uninstall
+        entry but the files are gone, this returns $null so the caller
+        treats the app as missing and reinstalls it.
+    #>
+    $exe = Test-LauncherPresent
+    if ($exe) {
+        try {
+            $v = (Get-Item $exe).VersionInfo.ProductVersion
+            if (-not [string]::IsNullOrWhiteSpace($v)) { return $v }
+        }
+        catch { }
     }
     return $null
 }
@@ -807,13 +897,16 @@ $successCount = 0
 $failCount    = 0
 $failedApps   = @()
 
-# ---------- Pre-flight: clean any Launcher installed under a different user ----------
+# ---------- Pre-flight: clean any Launcher installed under a wrong location ----------
 Write-Host "`n[Pre-flight] Checking for ArtCraft Launcher in wrong locations..." -ForegroundColor Cyan
-$wrongLauncherPath = Get-LauncherAdminInstallPath
-if ($wrongLauncherPath) {
-    Write-Host "  -> Found Launcher under another user profile: $wrongLauncherPath" -ForegroundColor Yellow
-    Write-Host "  -> Removing it because it is not runnable by the current user..." -ForegroundColor Yellow
+$correctLauncherDir = Get-LauncherCorrectInstallPath
+$wrongLauncherPath  = Get-LauncherAdminInstallPath
 
+if ($wrongLauncherPath) {
+    Write-Host "  -> Found Launcher in a wrong location: $wrongLauncherPath" -ForegroundColor Yellow
+    Write-Host "  -> Removing it because it is not the per-user install path..." -ForegroundColor Yellow
+
+    # Try a clean MSI uninstall first (best effort).
     $roots = @(
         'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\*',
         'HKLM:\SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall\*',
@@ -829,16 +922,38 @@ if ($wrongLauncherPath) {
 
     if ($launcherEntry) {
         $wrongProductCode = Split-Path $launcherEntry.PsPath -Leaf
-        $removed = Remove-ExistingInstallation -ProductName 'ArtCraft Launcher' `
-                                               -ProductCode $wrongProductCode `
-                                               -TargetScope 'wrong-user'
-        if (-not $removed) {
-            Write-Host "  -> Warning: Could not remove the wrong Launcher instance. Continuing anyway." -ForegroundColor DarkYellow
-        }
+        $null = Remove-ExistingInstallation -ProductName 'ArtCraft Launcher' `
+                                            -ProductCode $wrongProductCode `
+                                            -TargetScope 'wrong-user'
     }
     else {
-        Write-Host "  -> No uninstall entry found; removing folder directly." -ForegroundColor DarkYellow
+        Write-Host "  -> No matching uninstall entry; removing folder directly." -ForegroundColor DarkYellow
+    }
+
+    # Whatever the uninstaller did or did not do, make sure the folder is
+    # gone. A leftover exe here is exactly what made the script previously
+    # treat a misplaced Launcher as "installed".
+    if (Test-Path -LiteralPath $wrongLauncherPath) {
         Remove-Item -LiteralPath $wrongLauncherPath -Recurse -Force -ErrorAction SilentlyContinue
+        if (Test-Path -LiteralPath $wrongLauncherPath) {
+            Write-Host "  -> Warning: Could not remove '$wrongLauncherPath'. Manual cleanup may be required." -ForegroundColor DarkYellow
+        }
+        else {
+            Write-Host "  -> Wrong Launcher folder removed." -ForegroundColor Green
+        }
+    }
+
+    # Prune empty parent folders so future runs do not see ghost directories.
+    $currentUserCandidates = @(
+        (Join-Path $env:LOCALAPPDATA 'ArtCraft Launcher'),
+        (Join-Path $env:LOCALAPPDATA 'Programs\ArtCraft\Launcher'),
+        (Join-Path $env:LOCALAPPDATA 'Programs\ArtCraft')
+    )
+    foreach ($candidate in $currentUserCandidates) {
+        if ((Test-Path -LiteralPath $candidate) -and
+            -not (Get-ChildItem -LiteralPath $candidate -Force -ErrorAction SilentlyContinue)) {
+            Remove-Item -LiteralPath $candidate -Force -ErrorAction SilentlyContinue
+        }
     }
 }
 else {
@@ -864,13 +979,9 @@ foreach ($app in $apps) {
             continue
         }
 
-        $localVersion = $null
-        if ($launcherExe) {
-            try { $localVersion = (Get-Item $launcherExe).VersionInfo.ProductVersion } catch {}
-        }
-        if (-not $localVersion) {
-            $localVersion = Get-InstalledProductVersion -DisplayName $app.Name
-        }
+        # Version comes ONLY from a real file on disk. A stale registry entry
+        # after an uninstall is deliberately ignored.
+        $localVersion = Get-LauncherInstalledVersion
 
         if ($localVersion) {
             Write-Host "  -> State: Installed ($localVersion)" -ForegroundColor Green
@@ -893,15 +1004,21 @@ foreach ($app in $apps) {
         }
 
         if (Install-LauncherPerUser -Url $release.Url -Version $release.Version) {
+            # A successful msiexec exit code is not enough: verify the file really
+            # exists on disk. The MSI may install to the correct location, or to
+            # a legacy location if the package's own default differs from our
+            # expectation. Either way, an actual exe must be present.
             $verifyExe = Test-LauncherPresent
             if ($verifyExe) {
                 Write-Host "  -> Launcher verified at: $verifyExe" -ForegroundColor Green
                 $successCount++
             }
             else {
-                Write-Host "  -> Warning: Launcher install reported success but executable not found." -ForegroundColor DarkYellow
-                Write-Host "     Expected: $(Join-Path (Get-LauncherCorrectInstallPath) 'artcraft-launcher.exe')" -ForegroundColor DarkYellow
-                $successCount++
+                Write-Host "  -> ERROR: Launcher install reported success but no executable was found." -ForegroundColor Red
+                Write-Host "     Expected under: $correctLauncherDir" -ForegroundColor Red
+                Write-Host "     Check the MSI log: $env:TEMP\ArtCraftLauncher-msi.log" -ForegroundColor DarkYellow
+                $failCount++
+                $failedApps += $app.Name
             }
         }
         else {
