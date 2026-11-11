@@ -97,6 +97,9 @@
       * Post-install verification fails the app if no exe appears in the
         correct per-user location.
 
+    New in v14:
+    - New app added (MailCraft).
+
 #>
 
 $ProgressPreference = 'SilentlyContinue'
@@ -254,7 +257,8 @@ $appDefs = @(
     "SolidCraft|ArtCraft.SolidCraft|tangency-labs|solidcraft|SolidCraft.exe",
     "MaterialCraft|ArtCraft.MaterialCraft|storytold|materialcraft|MaterialCraft.exe",
     "TextureCraft|ArtCraft.TextureCraft|storytold|texturecraft|TextureCraft.exe",
-    "CraftAnything|ArtCraft.Craft-Anything|storytold|craft-anything|Craft-Anything.exe"
+    "CraftAnything|ArtCraft.Craft-Anything|storytold|craft-anything|Craft-Anything.exe",
+    "MailCraft|ArtCraft.MailCraft|UCS-Care-Group|mailcraft|MailCraft.exe"
 )
 
 # ---------- Version cache ----------
