@@ -100,6 +100,19 @@
     New in v14:
     - New app added (MailCraft).
 
+    New in v15:
+    - Launcher install location now follows the LOGGED-IN Windows user who
+      runs the script (owner of explorer.exe, not the elevated token):
+        * if that user is the admin account (name from $AdminUserName, or
+          the built-in Administrator), the Launcher is installed under the
+          admin's profile (e.g. C:\Users\Admin\AppData\Local\...);
+        * any other user gets it under their own profile
+          (e.g. C:\Users\john12\AppData\Local\...).
+    - On upgrade, if the Launcher is not found under the expected location
+      for the current user, the misplaced copy is uninstalled first (MSI
+      product code when available, folder cleanup afterwards) and the
+      Launcher is reinstalled fresh into the correct profile path.
+
 #>
 
 $ProgressPreference = 'SilentlyContinue'
@@ -109,6 +122,7 @@ try { [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::
 $UseWinget = $false
 $VersionCachePathOverride = ''
 $VersionCacheTTLHours = 24
+$AdminUserName = 'admin'
 # ===================================================================
 
 $defaultCacheFileName = 'artcraft-version-cache.json'
@@ -609,6 +623,56 @@ function Install-MsiFromUrl {
     return $false
 }
 
+# ---------- Launcher install-target resolution ----------
+function Get-LoggedInWindowsUserName {
+    # The owner of the interactive shell process (explorer.exe) is the
+    # Windows user that is actually logged in, even when this script is
+    # executed from an elevated PowerShell started by that user.
+    try {
+        $explorer = Get-Process -Name explorer -ErrorAction Stop | Select-Object -First 1
+        $wmiProc  = Get-CimInstance Win32_Process -Filter "ProcessId=$($explorer.Id)" -ErrorAction Stop
+        $owner    = Invoke-CimMethod -InputObject $wmiProc -MethodName GetOwner -ErrorAction Stop
+        if ($owner -and -not [string]::IsNullOrWhiteSpace($owner.User)) { return $owner.User }
+    }
+    catch { }
+    return $env:USERNAME
+}
+
+function Test-UserIsAdminAccount {
+    param([string]$UserName)
+    if ([string]::IsNullOrWhiteSpace($UserName)) { return $false }
+    # Explicitly configured admin account name.
+    if ($UserName -ieq $AdminUserName) { return $true }
+    # Built-in Administrator account (well-known RID 500).
+    try {
+        $builtinAdmin = Get-CimInstance Win32_UserAccount `
+            -Filter "LocalAccount=True AND SID LIKE 'S-1-5-21-%-500'" -ErrorAction Stop
+        if ($builtinAdmin -and $UserName -ieq $builtinAdmin.Name) { return $true }
+    }
+    catch { }
+    return $false
+}
+
+function Get-UserProfileDirectory {
+    param([string]$UserName)
+    if ([string]::IsNullOrWhiteSpace($UserName)) { return $env:USERPROFILE }
+    try {
+        $profile = Get-CimInstance Win32_UserProfile -ErrorAction Stop |
+            Where-Object { $_.LocalPath -and ((Split-Path -Leaf $_.LocalPath) -ieq $UserName) } |
+            Select-Object -First 1
+        if ($profile) { return $profile.LocalPath }
+    }
+    catch { }
+    return (Join-Path 'C:\Users' $UserName)
+}
+
+# The Launcher is ALWAYS installed under the profile of the logged-in
+# Windows user who runs this script: admin account -> admin's profile,
+# any other user -> that user's own profile.
+$script:loggedInUserName    = Get-LoggedInWindowsUserName
+$script:loggedInIsAdmin     = Test-UserIsAdminAccount -UserName $script:loggedInUserName
+$script:launcherProfileRoot = Get-UserProfileDirectory -UserName $script:loggedInUserName
+
 # ---------- Launcher-specific helpers ----------
 function Get-LauncherAdminInstallPath {
     <#
@@ -651,7 +715,7 @@ function Get-LauncherAdminInstallPath {
 }
 
 function Get-LauncherCorrectInstallPath {
-    return (Join-Path $env:LOCALAPPDATA 'Programs\ArtCraft Launcher')
+    return (Join-Path $script:launcherProfileRoot 'AppData\Local\Programs\ArtCraft Launcher')
 }
 
 function Test-LauncherPresent {
@@ -674,8 +738,8 @@ function Test-LauncherPresent {
     #    NOT the correct location, but an exe there is still a real install
     #    that the caller may want to upgrade/clean up.
     $legacyDirs = @(
-        (Join-Path $env:LOCALAPPDATA 'ArtCraft Launcher'),
-        (Join-Path $env:LOCALAPPDATA 'Programs\ArtCraft\Launcher')
+        (Join-Path $script:launcherProfileRoot 'AppData\Local\ArtCraft Launcher'),
+        (Join-Path $script:launcherProfileRoot 'AppData\Local\Programs\ArtCraft\Launcher')
     )
     foreach ($dir in $legacyDirs) {
         if (Test-Path -LiteralPath $dir) {
@@ -727,6 +791,49 @@ function Get-LauncherInstalledVersion {
         catch { }
     }
     return $null
+}
+
+function Remove-MisplacedLauncher {
+    <#
+        Removes a Launcher installation that does not live under the
+        expected location for the current logged-in user. Tries an MSI
+        uninstall via the product code first, then deletes any leftover
+        files so the fresh install starts clean.
+    #>
+    param([string]$ExePath)
+    $folder = Split-Path -Parent -Path $ExePath
+    Write-Host "  -> Launcher found outside the expected location: $folder" -ForegroundColor Yellow
+
+    $roots = @(
+        'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\*',
+        'HKLM:\SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall\*',
+        'HKCU:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\*'
+    )
+    $entry = Get-ItemProperty $roots -ErrorAction SilentlyContinue |
+        Where-Object {
+            $_.DisplayName -and
+            ((Normalize-Name -Name $_.DisplayName) -like '*artcraftlauncher*') -and
+            $_.InstallLocation -and
+            ($folder -like "$($_.InstallLocation.TrimEnd('\'))*")
+        } | Select-Object -First 1
+
+    if ($entry) {
+        $productCode = Split-Path $entry.PsPath -Leaf
+        Write-Host "  -> Uninstalling misplaced Launcher (product code: $productCode)..." -ForegroundColor Yellow
+        $null = Remove-ExistingInstallation -ProductName 'ArtCraft Launcher' `
+                                            -ProductCode $productCode `
+                                            -TargetScope 'misplaced-user'
+    }
+
+    if (Test-Path -LiteralPath $folder) {
+        Remove-Item -LiteralPath $folder -Recurse -Force -ErrorAction SilentlyContinue
+    }
+    if (-not (Test-Path -LiteralPath $folder)) {
+        Write-Host "  -> Misplaced Launcher removed." -ForegroundColor Green
+        return $true
+    }
+    Write-Host "  -> Warning: Could not fully remove '$folder'." -ForegroundColor DarkYellow
+    return $false
 }
 
 function Install-LauncherPerUser {
@@ -879,6 +986,8 @@ Write-Host "Logs will be written to: $env:TEMP" -ForegroundColor Gray
 Write-Host "MSI packages stored in: $downloadDir" -ForegroundColor Gray
 Write-Host "Version cache: $cacheFile" -ForegroundColor Gray
 Write-Host "  source: $cacheSource | TTL: ${cacheTTLHours}h" -ForegroundColor Gray
+Write-Host "Logged-in user: $script:loggedInUserName (admin account: $(if ($script:loggedInIsAdmin) { 'yes' } else { 'no' }))" -ForegroundColor Gray
+Write-Host "Launcher install target: $(Get-LauncherCorrectInstallPath)" -ForegroundColor Gray
 
 if (Test-PendingReboot) {
     Write-Host "NOTE: A system reboot is pending. Some MSI installations may fail with 1603." -ForegroundColor DarkYellow
@@ -973,6 +1082,14 @@ foreach ($app in $apps) {
     # ============================================================
     if ($app.Name -eq 'ArtCraftLauncher') {
         $launcherExe = Test-LauncherPresent
+        # Upgrade rule: if the Launcher exists but NOT under the correct
+        # location for the current logged-in user, uninstall it first and
+        # treat it as missing so it is reinstalled in the right place.
+        $correctLauncherDir = Get-LauncherCorrectInstallPath
+        if ($launcherExe -and -not ($launcherExe -like "$correctLauncherDir*")) {
+            $null = Remove-MisplacedLauncher -ExePath $launcherExe
+            $launcherExe = $null
+        }
         $release = Get-GitHubRelease-Cached -Owner $app.User -Repo $app.Repo
 
         if (-not $release) {
@@ -983,9 +1100,16 @@ foreach ($app in $apps) {
             continue
         }
 
-        # Version comes ONLY from a real file on disk. A stale registry entry
-        # after an uninstall is deliberately ignored.
-        $localVersion = Get-LauncherInstalledVersion
+        # Version comes ONLY from a real file on disk at the correct
+        # location (a stale registry entry is deliberately ignored).
+        $localVersion = $null
+        if ($launcherExe) {
+            try {
+                $v = (Get-Item -LiteralPath $launcherExe).VersionInfo.ProductVersion
+                if (-not [string]::IsNullOrWhiteSpace($v)) { $localVersion = $v }
+            }
+            catch { }
+        }
 
         if ($localVersion) {
             Write-Host "  -> State: Installed ($localVersion)" -ForegroundColor Green
