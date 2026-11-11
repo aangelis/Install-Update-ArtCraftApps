@@ -53,6 +53,7 @@ Based on the answers it then does exactly one of four things: **skip**, **upgrad
 | MaterialCraft | `ArtCraft.MaterialCraft` | `storytold` | `materialcraft` | `MaterialCraft.exe` |
 | TextureCraft | `ArtCraft.TextureCraft` | `storytold` | `texturecraft` | `TextureCraft.exe` |
 | Craft-Anything | `ArtCraft.Craft-Anything` | `storytold` | `craft-anything` | `Craft-Anything.exe` |
+| MailCraft | `ArtCraft.MailCraft` | `UCS-Care-Group` | `mailcraft` | `MailCraft.exe` |
 
 Adding another app is a one-line change — see [Configuration](#configuration).
 
@@ -163,17 +164,17 @@ Set-ExecutionPolicy -Scope Process Bypass
 .\Install-Update-ArtCraftApps.ps1
 ```
 
-The script is fully unattended: it prints a progress line per app (`[3/18] Processing VectorCraft...`) and finishes with a summary such as:
+The script is fully unattended: it prints a progress line per app (`[3/19] Processing VectorCraft...`) and finishes with a summary such as:
 
 ```
 ========================================
 Summary:
-  Successful: 18 / 18
-  Failed:     0 / 18
+  Successful: 19 / 19
+  Failed:     0 / 19
 
 Cache Statistics:
   GitHub API calls this run:  3
-  Cache hits this run:        15
+  Cache hits this run:        16
 
 MSI Packages Used/Stored:
   ArtCraftLauncher-0.14.0.msi
