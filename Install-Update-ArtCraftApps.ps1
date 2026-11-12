@@ -113,6 +113,22 @@
       product code when available, folder cleanup afterwards) and the
       Launcher is reinstalled fresh into the correct profile path.
 
+ New in v16:
+    - FIX: the per-user Launcher MSI is now executed AS THE LOGGED-IN USER,
+      not inside the elevated admin token. msiexec resolves per-user
+      properties (LOCALAPPDATA / LocalProgramsFolder) from the token of the
+      process that runs it, so an elevated run silently installed the
+      Launcher into the ADMIN profile even though the script computed the
+      correct target. A temporary one-shot scheduled task runs msiexec in
+      the logged-in user's interactive session instead.
+    - The verbose MSI log is written under the TARGET user's own Temp folder
+      (the elevated admin's %TEMP% is not writable by a standard user, and
+      msiexec fails with 1622 if it cannot open the /L*v log file).
+    - Post-install verification test block inside Install-LauncherPerUser:
+      msiexec exit code 0 alone is no longer treated as success; the exe
+      must really exist under the correct per-user location, otherwise the
+      install is reported as failed.
+
 #>
 
 $ProgressPreference = 'SilentlyContinue'
@@ -695,11 +711,11 @@ function Get-LauncherAdminInstallPath {
             ForEach-Object {
                 $profileRoot = $_.FullName
                 $candidates += Join-Path $profileRoot 'AppData\Local\ArtCraft Launcher'
-                $candidates += Join-Path $profileRoot 'AppData\Local\Programs\ArtCraft\Launcher'
+                # $candidates += Join-Path $profileRoot 'AppData\Local\Programs\ArtCraft\Launcher'
             }
     }
     $candidates += Join-Path $env:LOCALAPPDATA 'ArtCraft Launcher'
-    $candidates += Join-Path $env:LOCALAPPDATA 'Programs\ArtCraft\Launcher'
+    # $candidates += Join-Path $env:LOCALAPPDATA 'Programs\ArtCraft\Launcher'
 
     foreach ($path in $candidates) {
         # Never flag the real correct location as "wrong".
@@ -715,7 +731,7 @@ function Get-LauncherAdminInstallPath {
 }
 
 function Get-LauncherCorrectInstallPath {
-    return (Join-Path $script:launcherProfileRoot 'AppData\Local\Programs\ArtCraft Launcher')
+    return (Join-Path $script:launcherProfileRoot 'AppData\Local\Programs\ArtCraft\Launcher')
 }
 
 function Test-LauncherPresent {
@@ -836,6 +852,51 @@ function Remove-MisplacedLauncher {
     return $false
 }
 
+# ---------- Run a process as the logged-in (non-elevated) user ----------
+function Invoke-AsLoggedInUser {
+    <#
+        Runs a command in the interactive session of the logged-in user
+        (via a temporary one-shot scheduled task) and returns its exit code.
+        Needed because msiexec resolves per-user folders (LOCALAPPDATA etc.)
+        from the token of the process that runs it, so an elevated run
+        would install into the admin profile instead of the user's.
+    #>
+    param(
+        [string]$FilePath,
+        [string[]]$Arguments,
+        [int]$TimeoutSeconds = 900
+    )
+
+    $taskName = 'ArtCraftSuite-PerUserMsi'
+    # Quote any argument containing spaces so the task command line stays intact.
+    $argLine = ($Arguments | ForEach-Object {
+        if ($_ -match '\s') { "`"$_`"" } else { $_ }
+    }) -join ' '
+
+    $action    = New-ScheduledTaskAction -Execute $FilePath -Argument $argLine
+    $principal = New-ScheduledTaskPrincipal -UserId "$env:COMPUTERNAME\$script:loggedInUserName" `
+                    -LogonType Interactive -RunLevel Limited
+    $settings  = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries `
+                    -ExecutionTimeLimit (New-TimeSpan -Seconds $TimeoutSeconds)
+
+    Unregister-ScheduledTask -TaskName $taskName -Confirm:$false -ErrorAction SilentlyContinue
+    Register-ScheduledTask -TaskName $taskName -Action $action -Principal $principal `
+        -Settings $settings -Force -ErrorAction Stop | Out-Null
+
+    try {
+        Start-ScheduledTask -TaskName $taskName -ErrorAction Stop
+        $deadline = (Get-Date).AddSeconds($TimeoutSeconds)
+        while ((Get-ScheduledTask -TaskName $taskName).State -eq 'Running' -and (Get-Date) -lt $deadline) {
+            Start-Sleep -Seconds 2
+        }
+        $info = Get-ScheduledTaskInfo -TaskName $taskName
+        return [int]$info.LastTaskResult
+    }
+    finally {
+        Unregister-ScheduledTask -TaskName $taskName -Confirm:$false -ErrorAction SilentlyContinue
+    }
+}
+
 function Install-LauncherPerUser {
     param([string]$Url, [string]$Version)
 
@@ -844,7 +905,10 @@ function Install-LauncherPerUser {
     $msiFileName = "$appName-$versionClean.msi"
     $msiPath = Join-Path $downloadDir $msiFileName
     $partialPath = "$msiPath.part"
-    $logFile = Join-Path $env:TEMP "$appName-msi.log"
+    # Write the log where the *target* user can write: the elevated admin's
+    # %TEMP% is not writable by a standard user, and msiexec fails (1622)
+    # if it cannot open the /L*v log file.
+    $logFile = Join-Path $script:launcherProfileRoot "AppData\Local\Temp\$appName-msi.log"
 
     if (Test-Path -LiteralPath $msiPath) {
         Write-Host "  -> Reusing cached Launcher MSI: $msiFileName" -ForegroundColor Gray
@@ -863,7 +927,7 @@ function Install-LauncherPerUser {
         }
 
         if (-not (Test-IsMsiFile -Path $partialPath)) {
-            Write-Host "  -> The file is not a valid MSI. Deleting it." -ForegroundColor Red
+            Write-Host "  -> The file is not a valid MSI (probably an HTML page). Deleting it." -ForegroundColor Red
             Remove-Item $partialPath -Force -ErrorAction SilentlyContinue
             return $false
         }
@@ -888,17 +952,41 @@ function Install-LauncherPerUser {
     Start-Sleep -Seconds 2
 
     # *** No ALLUSERS=1 here. Per-user install is intentional. ***
-    $argList = "/i `"$msiPath`" /qn /norestart /L*v `"$logFile`""
+    # The MSI resolves LOCALAPPDATA from the token of whoever runs msiexec,
+    # so it must run as the logged-in user, not as the elevated admin.
+    $msiArgs = @('/i', $msiPath, '/qn', '/norestart', '/L*v', $logFile)
 
     for ($attempt = 1; $attempt -le 2; $attempt++) {
-        $proc = Start-Process msiexec.exe -ArgumentList $argList -Wait -PassThru -ErrorAction Continue
-        $code = 1620
-        if ($proc) { $code = $proc.ExitCode }
+        if ($script:loggedInUserName -ieq $env:USERNAME) {
+            # We are already running as the target user (admin's own console):
+            # a plain msiexec call is fine and faster.
+            $proc = Start-Process msiexec.exe -ArgumentList ($msiArgs -join ' ') -Wait -PassThru
+            $code = $proc.ExitCode
+        }
+        else {
+            # Elevated console under a different logged-in user:
+            # run msiexec inside that user's session.
+            Write-Host "  -> Installing under profile of: $script:loggedInUserName" -ForegroundColor Gray
+            $code = Invoke-AsLoggedInUser -FilePath "$env:SystemRoot\System32\msiexec.exe" -Arguments $msiArgs
+        }
 
         if ($code -eq 0 -or $code -eq 3010 -or $code -eq 1641) {
             if ($code -ne 0) { Write-Host "  -> Launcher installed (exit $code - reboot may be required)." -ForegroundColor Yellow }
             else { Write-Host "  -> Launcher installed successfully (per-user)." -ForegroundColor Green }
-            return $true
+            # ---------- Post-install verification (test block) ----------
+            # A successful msiexec exit code is not enough: verify that the
+            # Launcher executable really exists under the correct per-user
+            # location of the logged-in user before reporting success.
+            Start-Sleep -Seconds 2
+            $verifiedExe = Test-LauncherPresent
+            if ($verifiedExe) {
+                Write-Host "  -> Verified: Launcher exe found at $verifiedExe" -ForegroundColor Green
+                return $true
+            }
+            Write-Host "  -> ERROR: Launcher install reported success but no executable was found." -ForegroundColor Red
+            Write-Host "     Expected under: $(Get-LauncherCorrectInstallPath)" -ForegroundColor Red
+            Write-Host "     Check the MSI log: $logFile" -ForegroundColor DarkYellow
+            return $false
         }
         if ($code -eq 1618 -and $attempt -lt 2) {
             Write-Host "  -> Another installation is in progress (1618). Retrying in 15s..." -ForegroundColor DarkYellow
@@ -979,7 +1067,7 @@ foreach ($def in $appDefs) {
 if ($apps.Count -eq 0) { throw "No valid applications found in the definition list." }
 
 # ---------- HEADER ----------
-Write-Host "ArtCraft Suite Manager (Per-Machine Apps + Per-User Launcher v12)..." -ForegroundColor Cyan
+Write-Host "ArtCraft Suite Manager (Per-Machine Apps + Per-User Launcher v16)..." -ForegroundColor Cyan
 Write-Host "Other apps: forced per-machine (ALLUSERS=1). Launcher: per-user." -ForegroundColor Gray
 Write-Host "Winget usage: $(if ($wingetEnabled) { 'ENABLED' } else { 'DISABLED' })" -ForegroundColor Gray
 Write-Host "Logs will be written to: $env:TEMP" -ForegroundColor Gray
@@ -1144,7 +1232,7 @@ foreach ($app in $apps) {
             else {
                 Write-Host "  -> ERROR: Launcher install reported success but no executable was found." -ForegroundColor Red
                 Write-Host "     Expected under: $correctLauncherDir" -ForegroundColor Red
-                Write-Host "     Check the MSI log: $env:TEMP\ArtCraftLauncher-msi.log" -ForegroundColor DarkYellow
+                Write-Host "     Check the MSI log: $(Join-Path $script:launcherProfileRoot 'AppData\Local\Temp\ArtCraftLauncher-msi.log')" -ForegroundColor DarkYellow
                 $failCount++
                 $failedApps += $app.Name
             }
